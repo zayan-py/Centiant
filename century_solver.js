@@ -166,12 +166,17 @@ const Brain = require('./brain');
                     await centuryPage.goto(assignmentUrl, { waitUntil: 'load', timeout: 60000 }).catch(() => { });
                 }
 
-                // Broad check: Is the page actually "white" (zero text content)?
-                const isBlank = await centuryPage.evaluate(() => document.body.innerText.trim().length === 0);
+                // Broad check: Is the page actually "white" (zero content)?
+                const isBlank = await centuryPage.evaluate(() => {
+                    const text = document.body.innerText.trim();
+                    const hasApp = !!document.getElementById('app') || !!document.querySelector('.rc-app-container');
+                    const hasElements = document.body.querySelectorAll('div, section, main, header').length > 5;
+                    return text.length === 0 && !hasApp && !hasElements;
+                });
 
                 if (isBlank) {
                     console.log(`[Scraper] Page appears blank. Refreshing...`);
-                    await centuryPage.reload({ waitUntil: 'load' });
+                    await centuryPage.reload({ waitUntil: 'load' }).catch(() => { });
                     await centuryPage.waitForTimeout(5000); // Allow JS to settle
                 }
 
@@ -443,18 +448,18 @@ const Brain = require('./brain');
         }
     });
 
-    let questionStartTime = Date.now();
-    let stallWarningSent = false;
+    const getDelay = async (type) => {
+        const isTurbo = await guiPage.evaluate(() => document.getElementById('turbo-mode')?.checked || false);
+        if (isTurbo) return 100;
+        switch (type) {
+            case 'thinking': return 1500;
+            case 'feedback': return 3000;
+            case 'nav': return 1000;
+            default: return 1000;
+        }
+    };
 
     while (true) {
-        // Stall Detection Logic
-        const timeSpentOnQuestion = (Date.now() - questionStartTime) / 1000;
-        if (isSolverRunning && timeSpentOnQuestion > 120 && !stallWarningSent) {
-            console.log('[Stall] Question taking too long. Sending warning...');
-            await updateGuiStatus('STALL WARNING: MANUAL INTERVENTION NEEDED');
-            stallWarningSent = true;
-        }
-
         if (!isSolverRunning && nuggetQueue.length === 0) {
             // If not solving, just scan for assignments or wait
             if (centuryPage.url().includes('/assignments/due')) {
@@ -526,29 +531,23 @@ const Brain = require('./brain');
 
             // Scan for active question
             const scan = async (frame) => {
-                const candidates = await frame.$$('.rc-multiple-choice-question, .rc-learning-nugget__question-container, .multi-question__question, .rc-learning-question, [data-testid="labelling-question-board"]');
+                const candidates = await frame.$$('.rc-multiple-choice-question, .rc-learning-nugget__question-container, .multi-question__question, .rc-learning-question');
                 for (const c of candidates) {
                     if (await c.isVisible()) {
                         const isActive = await frame.evaluate(el => {
                             const rect = el.getBoundingClientRect();
                             const vh = window.innerHeight;
                             const vw = window.innerWidth;
+                            // Check if element is roughly centered or main focus
                             return Math.abs((rect.left + rect.width / 2) - vw / 2) < vw * 0.4 &&
                                 Math.abs((rect.top + rect.height / 2) - vh / 2) < vh * 0.5 &&
                                 rect.height > 20;
                         }, c);
                         if (isActive) {
-                            const header = await c.$('.rc-multiple-choice-question__question, .rc-learning-nugget__question-container, h2, h3, .question-text, [data-testid="labelling-question-board"]');
-                            const t = header ? (await header.innerText()).trim().split('\n')[0] : (await c.innerText()).trim().split('\n')[0];
+                            // Prefer the actual question text header if found
+                            const header = await c.$('.rc-multiple-choice-question__question, .rc-learning-nugget__question-container, h2, h3, .question-text');
+                            const t = header ? (await header.innerText()).trim() : (await c.innerText()).trim();
                             const full = (await c.innerText()).trim();
-
-                            // Timer Reset Logic: If this is a new question, reset the stall clock
-                            if (t && t !== lastSolvedQuestion) {
-                                console.log(`[Timer] Detected new question: "${t.substring(0, 30)}...". Resetting stall timer.`);
-                                questionStartTime = Date.now();
-                                stallWarningSent = false;
-                            }
-
                             if (t.length > 3) return { el: c, text: t, fullText: full };
                         }
                     }
@@ -562,12 +561,6 @@ const Brain = require('./brain');
                     found = await scan(f);
                     if (found) { currentFrame = f; break; }
                 }
-            }
-
-            // If no question found, keep timer updated to "now" so it doesn't stall while navigating
-            if (!found) {
-                questionStartTime = Date.now();
-                stallWarningSent = false;
             }
 
             if (found) {
@@ -711,10 +704,10 @@ const Brain = require('./brain');
                 }
 
                 // Matching Detection
-                const isMatchingText = found.text.match(/Match|Drag|Sort|Convert|Complete/i);
+                const isMatchingText = found.text.match(/Match|Drag|Sort|Convert/i);
                 const hasHeaders = await currentFrame.$(':has-text("Prompt")') && await currentFrame.$(':has-text("Answer")');
-                const hasMatchingBoard = await currentFrame.$('.alternative-board-matching, [data-testid="matching-question-board"], .rc-prompt-answer-list, [data-testid="labelling-question-board"]');
-                const targets = await currentFrame.$$('.match-target, .matching-target, [data-testid="match-target"], .prompt-answer-list__item, [data-testid="prompt-answer-pair-field"], [data-testid="labelling-question-image"]');
+                const hasMatchingBoard = await currentFrame.$('.alternative-board-matching, [data-testid="matching-question-board"], .rc-prompt-answer-list');
+                const targets = await currentFrame.$$('.match-target, .matching-target, [data-testid="match-target"], .prompt-answer-list__item, [data-testid="prompt-answer-pair-field"]');
                 const sources = await currentFrame.$$('.match-source, [draggable="true"], .draggable-label-item, .matching-additional-list__item');
                 let isMatching = !!hasMatchingBoard || (targets.length > 0 && sources.length > 0) || (isMatchingText && hasHeaders);
 
@@ -731,27 +724,16 @@ const Brain = require('./brain');
                         const targetTexts = []; const sourceTexts = [];
                         const targetElements = []; const sourceElements = [];
 
-                        // Century-specific Prompt/Answer list extraction (including Labelling)
-                        const matchingRows = await currentFrame.$$('.prompt-answer-list__item, .rc-prompt-answer-pair, .rc-label-pair-list__item');
+                        // Century-specific Prompt/Answer list extraction
+                        const matchingRows = await currentFrame.$$('.prompt-answer-list__item, .rc-prompt-answer-pair');
                         if (matchingRows.length > 0) {
                             for (const row of matchingRows) {
-                                const fields = await row.$$('.rc-prompt-answer-pair__field, [data-testid="prompt-answer-pair-field"], .rc-label-pair-base__field');
+                                const fields = await row.$$('.rc-prompt-answer-pair__field, [data-testid="prompt-answer-pair-field"]');
                                 if (fields.length >= 2) {
-                                    // Target can be text or image in labelling
-                                    let pText = (await fields[0].innerText()).trim();
-                                    if (!pText) {
-                                        const img = await fields[0].$('[data-testid="labelling-question-image"] img, img');
-                                        if (img) {
-                                            const src = await img.getAttribute('src');
-                                            // Heuristic for labelling images: red/green polygons
-                                            if (src.includes('base64')) pText = `[Diagram Section ${targetTexts.length + 1}]`;
-                                            else pText = `[Image ${targetTexts.length + 1}]`;
-                                        }
-                                    }
-
+                                    const pText = (await fields[0].innerText()).trim();
                                     if (pText) {
                                         targetTexts.push(pText);
-                                        targetElements.push(fields[1]); // The drop destination
+                                        targetElements.push(fields[1]); // The drop destination (Answer field)
                                     }
                                 }
                             }

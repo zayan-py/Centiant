@@ -20,3 +20,8 @@
 ### Changed
 - **Performance:** Optimized the main event loop to reduce unnecessary page navigations and API calls.
 - **Logging:** Enhanced console output for better debugging of matching logic and scraper errors.
+
+### Security
+- **Environment Variables:** Implemented `dotenv` for credential management. API keys and login details can now be stored in a `.env` file.
+- **Git Protection:** Added a `.gitignore` file to ensure sensitive configurations and log files are not accidentally committed to GitHub.
+- **Template Provided:** Added `.env.example` to guide setup for new environments.

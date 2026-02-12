@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -5,14 +6,20 @@ const Brain = require('./brain');
 
 (async () => {
     // 1. Load config
-    let config = { username: "", password: "" };
+    let config = {
+        username: process.env.CENTURY_USERNAME || "",
+        password: process.env.CENTURY_PASSWORD || "",
+        openai_api_key: process.env.OPENAI_API_KEY || ""
+    };
+
     const configPath = path.join(__dirname, 'config.json');
     if (fs.existsSync(configPath)) {
         try {
-            config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            console.log('Loaded credentials from config.json');
+            const fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            config = { ...config, ...fileConfig };
+            console.log('Loaded credentials (merged .env and config.json)');
         } catch (e) {
-            console.log('Error reading config.json, using defaults.');
+            console.log('Error reading config.json, using .env defaults.');
         }
     }
 

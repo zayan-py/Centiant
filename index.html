@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Century Solver Pro - Dashboard</title>
+    <link rel="stylesheet" href="index.css">
+</head>
+
+<body>
+    <div class="dashboard">
+        <header>
+            <div class="logo">
+                <span class="gear">⚙️</span>
+                <h1>CENTURY SOLVER <span>PRO</span></h1>
+            </div>
+            <div class="status-indicator">
+                <button id="force-refresh" class="refresh-btn" title="Force Refresh">↻</button>
+                <div class="pulse-ring" id="status-pulse"></div>
+                <span id="status-text">OFFLINE</span>
+            </div>
+        </header>
+
+        <!-- Connectivity Guard -->
+        <div id="offline-overlay" class="offline-warning">
+            <div class="warning-card">
+                <h2>🚫 PRO BACKEND NOT DETECTED</h2>
+                <p>This Dashboard is a remote control. It ONLY works if the solver script is running.</p>
+                <p><strong>To fix:</strong> Close this tab and double-click <code>run.bat</code> in your folder.</p>
+            </div>
+        </div>
+
+        <section class="card glass discovery-panel">
+            <div class="panel-header">
+                <h3>Assignment Discovery</h3>
+                <button id="fetch-btn" class="action-btn">FETCH DUE TASKS</button>
+            </div>
+            <div id="assignments-list" class="assignments-grid">
+                <p class="empty-msg">Click Fetch to scan for due assignments...</p>
+            </div>
+        </section>
+
+        <main>
+            <div class="card glass">
+                <h3>CURRENT QUESTION</h3>
+                <div id="question-text" class="question-box">
+                    Waiting for script to detect a question...
+                </div>
+                <div id="options-container" class="options-grid">
+                    <!-- Options populated via JS -->
+                </div>
+                <div id="text-answer-container" class="text-input-box" style="display: none;">
+                    <textarea id="text-answer" placeholder="Type your answer here..."></textarea>
+                    <button id="submit-text-answer">SUBMIT TEXT ANSWER</button>
+                </div>
+            </div>
+
+            <div class="side-panel">
+                <div class="card glass small highlight">
+                    <h3>CONTROLS</h3>
+
+                    <div class="setting">
+                        <span class="pulse-text">Auto-Solve</span>
+                        <label class="switch">
+                            <input type="checkbox" id="auto-solve" checked>
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting">
+                        <span>Skip Lessons</span>
+                        <label class="switch">
+                            <input type="checkbox" id="skip-lessons" checked>
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+
+                    <div class="setting">
+                        <span style="color: #bc8cff; font-weight: bold;">Turbo Mode ⚡</span>
+                        <label class="switch">
+                            <input type="checkbox" id="turbo-mode">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+
+                    <p class="hint">Turbo Mode removes all delays. 0.1s reaction time.</p>
+                </div>
+
+                <div class="card glass small">
+                    <h3>PROGRESS</h3>
+                    <div class="progress-stats">
+                        <div class="stat-item">
+                            <span class="stat-label">Queue</span>
+                            <span class="stat-value" id="queue-count">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Accuracy</span>
+                            <span class="stat-value" id="avg-accuracy">--%</span>
+                        </div>
+                    </div>
+                    <div class="progress-container">
+                        <div class="progress-bar" id="progress-bar" style="width: 0%;"></div>
+                    </div>
+                    <div class="queue-list-container">
+                        <ul id="queue-list-items" class="queue-list">
+                            <!-- Nuggets queue items -->
+                        </ul>
+                    </div>
+                    <span id="progress-percent">0%</span>
+                </div>
+            </div>
+        </main>
+
+        <footer>
+            <p>&copy; 2026 Century Solver Pro - Built for Efficiency</p>
+        </footer>
+    </div>
+</body>
+
+</html>

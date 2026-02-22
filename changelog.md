@@ -1,5 +1,21 @@
 # Century Solver Changelog
 
+## [1.3.0] - 2026-02-17
+
+### Fixed
+- **Unreliability & Stalling:**
+  - Implemented automatic page reload as a last-resort recovery when the solver is stuck on a question for >90s.
+  - Fixed a critical bug where the internal question timer was resetting every loop iteration, preventing proper "stuck" detection.
+  - Increased base detection thresholds and timeouts to accommodate slower AI response times and turbo variations.
+  - Resolved potential "Cannot access variable before initialization" errors by restructuring loop variable scopes.
+- **Accuracy Improvements:**
+  - **Enhanced Context Awareness:** The solver now scrapes instructions, hints, and introductory text from the page to provide better context to the AI (e.g., specific rules for the nugget).
+  - **Logic Strengthening:** Updated the Brain module to use Chain-of-Thought (CoT) reasoning, forcing the model to think step-by-step before providing an answer.
+  - **Improved Matching:** Refined matching logic to handle complex label pairs and image-based targets more robustly.
+- **Error Handling:**
+  - Added fatal error detection for browser disconnections to prevent infinite recovery loops.
+  - Improved button detection for assignment navigation and feedback dismissal.
+
 ## [1.2.0] - 2026-02-12
 
 ### Fixed

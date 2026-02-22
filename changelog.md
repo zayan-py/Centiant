@@ -11,6 +11,13 @@
   - Fixed an issue where the scraper would aggressively refresh the page in the background, causing interruption.
   - Implemented smarter "white screen" detection that only refreshes if the page is truly empty (no text/elements).
   - Added a 3-attempt retry mechanism with delays for initial assignment loading.
+- **Nugget Transitions:**
+  - Implemented an "Aggressive Jump" feature that transitions to the next nugget immediately when accuracy/feedback is detected.
+  - Added logic to detect and dismiss "Your answer has been submitted!" overlays that block navigation.
+  - Expanded button detection to handle varying text casing (e.g., "NEXT QUESTION" vs "Next Question").
+- **Question Type Support:**
+  - Added support for Dropdown/Select inputs (common in "Additional Answers" sections).
+  - The solver can now identify standard `<select>` elements and custom `.rc-dropdown` components.
 
 ### Added
 - **`safeClick` Helper:** Restored and improved the click helper to handle stubborn elements with fallback strategies (force click, evaluate click).

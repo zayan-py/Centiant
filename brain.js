@@ -10,17 +10,22 @@ class Brain {
         const openai = new OpenAI({ apiKey: apiKey });
         const model = 'gpt-4o';
 
-        let prompt = `You are a helpful AI assistant solving a multiple choice question.
+        let prompt = `You are a world-class academic tutor specializing in the UK curriculum (GCSE/A-Level/KS3).
 Context: ${context || 'General Knowledge'}
 Question: ${question}
 Options: ${options.join(', ')}
 
-Please analyze the question and select the correct option.
+INSTRUCTIONS:
+1. Think step-by-step before answering.
+2. Pay EXTREME attention to negative keywords (e.g., "NOT", "FALSE", "INCORRECT", "EXCEPT").
+3. For science/math, verify units carefully.
+4. Select the MOST ACCURATE option.
+
 Return your answer in the following JSON format:
 {
     "type": "index" or "text",
     "value": (index of option starting at 1 OR the text answer),
-    "reasoning": "Brief explanation"
+    "reasoning": "Step-by-step explanation of why this is the correct answer and others are wrong."
 }`;
 
         if (hasGuppy) {
@@ -64,12 +69,16 @@ If the answer requires a formula or specific math notation, provide the text rep
         const openai = new OpenAI({ apiKey: apiKey });
         const model = 'gpt-4o';
 
-        let prompt = `You are solving a matching question.
+        let prompt = `You are a world-class academic tutor specializing in UK Curriculum.
 Context: ${context || 'General'}
 Targets (Fixed Items): ${targets.join(', ')}
 Sources (Draggable Items): ${sources.join(', ')}
 
-Pair each Target with the correct Source.
+INSTRUCTIONS:
+1. Pair every Target with the correct Source.
+2. Think step-by-step to verify relationships.
+3. Be precise with definitions.
+
 Return a JSON object where update keys are Target text and values are matching Source text.
 Example: { "Capital of France": "Paris", "Capital of Spain": "Madrid" }`;
 

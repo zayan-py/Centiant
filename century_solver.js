@@ -6,6 +6,7 @@ const Brain = require('./brain');
 
 (async () => {
     // 1. Load config
+    // Prioritize .env variables, then fallback to config.json
     let config = {
         username: process.env.CENTURY_USERNAME || "",
         password: process.env.CENTURY_PASSWORD || "",
@@ -16,11 +17,21 @@ const Brain = require('./brain');
     if (fs.existsSync(configPath)) {
         try {
             const fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            config = { ...config, ...fileConfig };
-            console.log('Loaded credentials (merged .env and config.json)');
+            // Only use config.json values if they aren't already set by .env
+            if (!config.username && fileConfig.username) config.username = fileConfig.username;
+            if (!config.password && fileConfig.password) config.password = fileConfig.password;
+            if (!config.openai_api_key && fileConfig.openai_api_key) config.openai_api_key = fileConfig.openai_api_key;
+
+            console.log('Loaded credentials (using .env with config.json fallback)');
         } catch (e) {
             console.log('Error reading config.json, using .env defaults.');
         }
+    }
+
+    if (config.openai_api_key) {
+        console.log(`[Config] Using API Key ending in: ...${config.openai_api_key.slice(-4)}`);
+    } else {
+        console.log('[Config] WARNING: No OpenAI API Key found!');
     }
 
     // 2. Launch Browser with two tabs
@@ -43,6 +54,7 @@ const Brain = require('./brain');
     let resolveUrl = null;
     let resolveAnswer = null;
     let lastSolvedQuestion = '';
+    let sameQuestionAttempts = 0;
     let lastLoggedNugget = '';
     let nuggetContext = '';
     let nuggetQueue = [];
@@ -201,7 +213,7 @@ const Brain = require('./brain');
                             if (indicator) score = parseInt(indicator.getAttribute('data-score') || '0');
                             else if (ring) score = parseInt(ring.getAttribute('data-score') || '0');
 
-                            if (score < 100) {
+                            if (score < 80) {
                                 queue.push({
                                     url: link.href,
                                     title: titleEl.innerText.trim(),
@@ -291,6 +303,12 @@ const Brain = require('./brain');
         console.log('Logged in successfully.');
         await updateGuiStatus('AUTO-SCRAPING ASSIGNMENTS...');
         await centuryPage.goto('https://app.century.tech/learn/assignments/due');
+        await updateGuiStatus('READY - Auto-fetching tasks...');
+        // Automatically trigger the fetch button in the GUI
+        await guiPage.evaluate(() => {
+            const btn = document.getElementById('fetch-btn');
+            if (btn) btn.click();
+        });
         await updateGuiStatus('READY - Check Assignments Panel');
     } catch (e) {
         await updateGuiStatus('LOGIN ERROR - Check config.json');
@@ -513,7 +531,7 @@ const Brain = require('./brain');
                                 if (scoreRing) {
                                     score = parseInt(await scoreRing.getAttribute('data-score') || '0');
                                 }
-                                if (score < 100) {
+                                if (score < 80) {
                                     const fullUrl = 'https://app.century.tech' + href;
                                     if (!nuggetQueue.includes(fullUrl)) nuggetQueue.push(fullUrl);
                                 }
@@ -584,38 +602,54 @@ const Brain = require('./brain');
                 if (isFeedback) {
                     await updateGuiStatus('FEEDBACK DETECTED');
 
+                    // Check for and dismiss common overlays like "Your answer has been submitted!"
+                    const overlays = await currentFrame.$$('.rc-modal, .cds-modal, .rc-answer-feedback__popup, h2:has-text("submitted"), h1:has-text("submitted")');
+                    if (overlays.length > 0) {
+                        console.log('[Feedback] Dismissing submitted/feedback overlay...');
+                        await centuryPage.mouse.click(10, 10); // Click outside/top-left to dismiss if modal
+                        await centuryPage.waitForTimeout(500);
+                    }
+
                     // Accuracy extraction
-                    const statsSelectors = ['.cds-stat-value__value', '[data-testid="nugget-score-value"]', '.rc-percentage-ring--score'];
+                    const statsSelectors = ['.cds-stat-value__value', '[data-testid="nugget-score-value"]', '.rc-percentage-ring--score', '.rc-results__score'];
                     let acc = null;
                     for (const sel of statsSelectors) {
                         const elements = await centuryPage.$$(sel);
                         for (const el of elements) {
-                            const text = await el.innerText();
+                            const text = await (await el.innerText()).trim();
                             if (text.includes('%')) {
                                 const val = parseInt(text.replace(/\D/g, ''));
-                                const parentText = await centuryPage.evaluate(e => e.parentElement?.innerText || '', el);
-                                if (parentText.toLowerCase().match(/score|accuracy|correct/)) {
-                                    acc = val; break;
+                                if (!isNaN(val)) {
+                                    const parentText = await centuryPage.evaluate(e => e.parentElement?.innerText || '', el);
+                                    if (parentText.toLowerCase().match(/score|accuracy|correct|completion/)) {
+                                        acc = val; break;
+                                    }
                                 }
                             }
                         }
                         if (acc !== null) break;
                     }
 
-                    if (acc !== null && !isNaN(acc) && lastLoggedNugget !== nuggetContext) {
-                        console.log(`[Stats] Accuracy Recorded: ${acc}%`);
-                        allScores.push(acc);
-                        fs.appendFileSync(scoresPath, `${acc}\n`);
-                        lastLoggedNugget = nuggetContext;
-                        await updateGuiStats();
-                        await updateGuiStatus('NUGGET COMPLETE!');
-                        if (await navigateToNextNugget()) continue;
+                    if (acc !== null && !isNaN(acc)) {
+                        if (lastLoggedNugget !== nuggetContext) {
+                            console.log(`[Stats] Accuracy Recorded: ${acc}%`);
+                            allScores.push(acc);
+                            fs.appendFileSync(scoresPath, `${acc}\n`);
+                            lastLoggedNugget = nuggetContext;
+                            await updateGuiStats();
+                            await updateGuiStatus('NUGGET COMPLETE!');
+                        }
+
+                        // AGGRESSIVE JUMP: If we have feedback/results, try to go to next nugget immediately
+                        if (nuggetQueue.length > 0) {
+                            if (await navigateToNextNugget()) continue;
+                        }
                     }
 
-                    const nextBtn = await currentFrame.$('button:has-text("Next Nugget"), button:has-text("Next Question"), button:has-text("Next"), button:has-text("View results"), button:has-text("Continue"), [data-testid="next-button"], [data-testid="button-next-question"]');
+                    const nextBtn = await currentFrame.$('button:has-text("Next Nugget"), button:has-text("NEXT NUGGET"), button:has-text("Next Question"), button:has-text("NEXT QUESTION"), button:has-text("Next"), button:has-text("NEXT"), button:has-text("View results"), button:has-text("Continue"), [data-testid="next-button"], [data-testid="button-next-question"]');
                     if (nextBtn && await nextBtn.isVisible()) {
-                        const btnText = await nextBtn.innerText().catch(() => '');
-                        const isNuggetEnd = btnText.toLowerCase().includes('next nugget') ||
+                        const btnText = (await nextBtn.innerText().catch(() => '')).toLowerCase();
+                        const isNuggetEnd = btnText.includes('next nugget') ||
                             found.fullText.includes('100%') ||
                             found.fullText.includes('Completion');
 
@@ -625,17 +659,42 @@ const Brain = require('./brain');
                             } else {
                                 await updateGuiStatus('ASSIGNMENT COMPLETE!');
                                 await centuryPage.waitForTimeout(3000);
+                                // If we are at the very end, maybe go back to assignments
+                                if (!nuggetQueue.length) {
+                                    await centuryPage.goto('https://app.century.tech/learn/assignments/due').catch(() => { });
+                                    await centuryPage.waitForTimeout(3000);
+                                }
                                 continue;
                             }
                         }
 
                         await safeClick(nextBtn, 'Next Button');
-                        await centuryPage.waitForTimeout(await getDelay('feedback') / 5);
+                        await centuryPage.waitForTimeout(await getDelay('nav'));
                     }
                     continue;
                 }
 
                 if (found.text === lastSolvedQuestion) {
+                    sameQuestionAttempts++;
+                    console.log(`[Flow] Same question detected (Attempt ${sameQuestionAttempts})`);
+
+                    if (sameQuestionAttempts > 3) {
+                        console.log('[Flow] STUCK DETECTED. Attempting to skip via "I Don\'t Know"...');
+                        await updateGuiStatus('STUCK - SKIPPING...');
+
+                        // Try finding 'I don't know' or similar escape buttons
+                        const idkBtn = await currentFrame.$('button:has-text("I don\'t know"), button:has-text("I Don\'t Know"), [data-testid="idk-button"]');
+                        if (idkBtn && await idkBtn.isVisible()) {
+                            await safeClick(idkBtn, "I Don't Know Button");
+                            await centuryPage.waitForTimeout(await getDelay('nav'));
+                            sameQuestionAttempts = 0; // Reset after action
+                            continue;
+                        } else {
+                            console.log('[Flow] No "I Don\'t Know" button found. Trying skip...');
+                            // Fallback: Try next button again just in case
+                        }
+                    }
+
                     // Even if text is same, if there's a next button, we should click it
                     const nextBtn = await currentFrame.$('[data-testid="button-next-question"], button.btn--secondary:has-text("Next Question")');
                     if (nextBtn && await nextBtn.isVisible()) {
@@ -646,6 +705,8 @@ const Brain = require('./brain');
 
                     await centuryPage.waitForTimeout(await getDelay('nav'));
                     continue;
+                } else {
+                    sameQuestionAttempts = 0; // New question, reset counter
                 }
 
                 await updateGuiStatus('QUESTION DETECTED');
@@ -655,7 +716,10 @@ const Brain = require('./brain');
                 const hasImage = await currentFrame.$('img:not([alt="icon"]), svg.diagram, .question-image');
                 if (hasImage) {
                     try {
-                        const container = await currentFrame.$('.rc-learning-nugget__question-container, .multi-question__question') || currentFrame.locator('body');
+                        // Priority: Label Board -> Question Container -> Body
+                        const labelBoard = await currentFrame.$('[data-testid="labelling-question-board"], .rc-label-pair-list');
+                        const container = labelBoard || await currentFrame.$('.rc-learning-nugget__question-container, .multi-question__question') || currentFrame.locator('body');
+
                         const buffer = await container.screenshot({ scale: 'css' });
                         imageBase64 = buffer.toString('base64');
                         await updateGuiStatus('ANALYZING IMAGE...');
@@ -714,9 +778,10 @@ const Brain = require('./brain');
                 const isMatchingText = found.text.match(/Match|Drag|Sort|Convert/i);
                 const hasHeaders = await currentFrame.$(':has-text("Prompt")') && await currentFrame.$(':has-text("Answer")');
                 const hasMatchingBoard = await currentFrame.$('.alternative-board-matching, [data-testid="matching-question-board"], .rc-prompt-answer-list');
-                const targets = await currentFrame.$$('.match-target, .matching-target, [data-testid="match-target"], .prompt-answer-list__item, [data-testid="prompt-answer-pair-field"]');
-                const sources = await currentFrame.$$('.match-source, [draggable="true"], .draggable-label-item, .matching-additional-list__item');
-                let isMatching = !!hasMatchingBoard || (targets.length > 0 && sources.length > 0) || (isMatchingText && hasHeaders);
+                const hasLabelPairs = await currentFrame.$('.rc-label-pair-list, [data-testid="labelling-question-board"]');
+                const targets = await currentFrame.$$('.match-target, .matching-target, [data-testid="match-target"], .prompt-answer-list__item, [data-testid="prompt-answer-pair-field"], .rc-label-pair-list__item');
+                const sources = await currentFrame.$$('.match-source, [draggable="true"], .draggable-label-item, .matching-additional-list__item, .rc-label-pair-base__field');
+                let isMatching = !!hasMatchingBoard || !!hasLabelPairs || (targets.length > 0 && sources.length > 0) || (isMatchingText && hasHeaders);
 
                 await pushQuestionToGui(found.text, options);
 
@@ -742,6 +807,25 @@ const Brain = require('./brain');
                                         targetTexts.push(pText);
                                         targetElements.push(fields[1]); // The drop destination (Answer field)
                                     }
+                                }
+                            }
+                        }
+
+                        // Label Pair List Extraction
+                        if (targetTexts.length === 0) {
+                            const labelItems = await currentFrame.$$('.rc-label-pair-list__item');
+                            if (labelItems.length > 0) {
+                                for (let i = 0; i < labelItems.length; i++) {
+                                    const item = labelItems[i];
+                                    // The drop target is usually the item itself or a child .dnd-drop-target
+                                    const dropZone = await item.$('.dnd-drop-target') || item;
+
+                                    // Try to get text, otherwise denote as Image Target
+                                    let text = await item.innerText().catch(() => '');
+                                    if (!text.trim()) text = `[Target Card ${i + 1}]`;
+
+                                    targetTexts.push(text);
+                                    targetElements.push(dropZone);
                                 }
                             }
                         }
@@ -874,6 +958,36 @@ const Brain = require('./brain');
                             await ti.fill(response.value);
                             const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
                             if (submitBtn) await safeClick(submitBtn, 'Submit');
+                        }
+                        // 1.5. Try Dropdowns / Selects
+                        else if (await currentFrame.$('select, .rc-dropdown, .rc-dropdown__toggle, [data-testid="dropdown-trigger"], [role="combobox"], .rc-select')) {
+                            const dropdown = await currentFrame.$('select, .rc-dropdown, .rc-dropdown__toggle, [data-testid="dropdown-trigger"], [role="combobox"], .rc-select');
+                            if (dropdown && await dropdown.isVisible()) {
+                                console.log('[Text Mode] Dropdown detected. Attempting interaction...');
+                                const tagName = await dropdown.evaluate(el => el.tagName.toLowerCase());
+
+                                if (tagName === 'select') {
+                                    // Standard <select>
+                                    await dropdown.selectOption({ label: response.value }).catch(() => dropdown.selectOption({ value: response.value })).catch(() => { });
+                                } else {
+                                    // Custom Dropdown (click to open, then select)
+                                    await safeClick(dropdown, 'Dropdown Trigger');
+                                    await centuryPage.waitForTimeout(500);
+
+                                    // Try exact match first
+                                    const option = currentFrame.getByText(response.value, { exact: true }).first();
+                                    if (await option.isVisible()) {
+                                        await option.click();
+                                    } else {
+                                        // Case-insensitive fallback
+                                        const optionCi = currentFrame.getByText(response.value, { exact: false }).first();
+                                        if (await optionCi.isVisible()) await optionCi.click();
+                                    }
+                                }
+                                await centuryPage.waitForTimeout(500);
+                                const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
+                                if (submitBtn) await safeClick(submitBtn, 'Submit');
+                            }
                         }
                         // 2. Try Guppy Math
                         else if (await currentFrame.$('.guppy, .guppy_elt, [id*="guppy"]')) {

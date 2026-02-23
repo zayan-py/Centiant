@@ -35,8 +35,11 @@ const Brain = require('./brain');
     }
 
     // 2. Launch Browser with two tabs
-    const browser = await chromium.launch({ headless: false });
-    const context = await browser.newContext();
+    const browser = await chromium.launch({
+        headless: false,
+        args: ['--start-maximized']
+    });
+    const context = await browser.newContext({ viewport: null });
 
     // TAB 1: Dashboard GUI
     const guiPage = await context.newPage();
@@ -79,7 +82,233 @@ const Brain = require('./brain');
         }
     }
 
+
+    // --- AUTOMATION HELPERS ---
+    // Helper: High-speed direct click bypassing human-like scrolling
+    const safeClick = async (locator) => {
+        if (!locator) return;
+        await locator.click({ force: true, timeout: 2000 }).catch(() => { });
+    };
+
+    // Helper: Deduplicated score logger
+    const logScore = async (acc) => {
+        if (acc !== null && !isNaN(acc) && lastLoggedNugget !== nuggetContext) {
+            console.log(`[Stats] Accuracy Recorded: ${acc}%`);
+            allScores.push(acc);
+            fs.appendFileSync(scoresPath, `${acc}\n`);
+            lastLoggedNugget = nuggetContext;
+            await updateGuiStats();
+        }
+    };
+
+    // Helper: Deep text normalization (collapses whitespace/newlines)
+    const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+    const executeSequentialDrag = async (frame, pairings) => {
+        // Guard: already submitted? 
+        const isSubmitted = await frame.$('.rc-prompt-answer-list--submitted, .matching-submitted-pairs, .assessment-slide--submitted').then(el => !!el).catch(() => false);
+        if (isSubmitted) {
+            console.log('[SeqDrag] Board already submitted — skipping');
+            return 0;
+        }
+
+        let successCount = 0;
+
+        // ── Layout A: Label-Pair-List (image-based targets / Matching v2) ─────
+        const labelPairRows = frame.locator('.rc-label-pair-list__item');
+        const lpCount = await labelPairRows.count().catch(() => 0);
+        if (lpCount > 0) {
+            console.log(`[SeqDrag] Layout A: Matching v2 detected — Processing ${lpCount} image/card targets...`);
+            const pairKeys = Object.keys(pairings);
+            const availableSources = []; // Track sources already dragged (prevents cross-row swapping)
+            for (let i = 0; i < lpCount; i++) {
+                try {
+                    const targetName = `Card ${i + 1}`;
+                    const cardKey = pairKeys.find(k => {
+                        const cleanK = cleanText(k);
+                        const cleanT = cleanText(targetName);
+                        return cleanK === cleanT || cleanK === `${i + 1}` || cleanK === `[target card ${i + 1}]` || cleanK.endsWith(` ${i + 1}`);
+                    });
+
+                    if (!cardKey) {
+                        console.log(`[SeqDrag] No pairing provided for ${targetName} — skipping`);
+                        continue;
+                    }
+
+                    const expectedSource = pairings[cardKey] ? cleanText(pairings[cardKey]) : null;
+                    if (!expectedSource) continue;
+
+                    const targetRow = labelPairRows.nth(i);
+                    const dropZone = targetRow.locator('.click-select-drop, .rc-label-pair-base__field--empty, [class*="drop"]').first();
+
+                    // Skip if already CORRECT (not just filled)
+                    const currentText = cleanText(await dropZone.innerText().catch(() => ''));
+                    // Strict text check + check if it actually contains a draggable (to be double sure)
+                    const hasDraggable = await dropZone.locator('[draggable="true"]').count().catch(() => 0) > 0;
+                    if (hasDraggable && currentText === expectedSource) {
+                        console.log(`[SeqDrag] Card ${i + 1} already correct ("${expectedSource}") — skipping`);
+                        availableSources.push(expectedSource); // Mark as used
+                        successCount++;
+                        continue;
+                    }
+
+                    // 1. First attempt: Find source in the "Additional Answers" dock (available pool)
+                    // Skip any source already claimed by a prior row
+                    const dockDraggables = await frame.locator('.draggable-label-container [draggable="true"]').all();
+                    let sourceEl = null;
+                    for (const d of dockDraggables) {
+                        const txt = cleanText(await d.innerText().catch(() => ''));
+                        if (availableSources.includes(txt)) continue; // Already used
+                        if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
+                            const isVis = await d.isVisible().catch(() => false);
+                            if (isVis) { sourceEl = d; break; }
+                        }
+                    }
+
+                    // 2. Fallback: Any draggable element with matching text (not placed in a target card)
+                    if (!sourceEl) {
+                        const allDraggables = await frame.locator('[draggable="true"]').all();
+                        for (const d of allDraggables) {
+                            const txt = cleanText(await d.innerText().catch(() => ''));
+                            if (availableSources.includes(txt)) continue; // Already used
+                            const isPlaced = await d.evaluate(el => !!el.closest('.rc-label-pair-list__item')).catch(() => false);
+                            if (isPlaced) continue;
+                            if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
+                                sourceEl = d; break;
+                            }
+                        }
+                    }
+
+                    if (sourceEl) {
+                        console.log(`[SeqDrag] Card ${i + 1}: Dragging "${expectedSource}"`);
+                        await dropZone.scrollIntoViewIfNeeded().catch(() => { });
+                        await sourceEl.dragTo(dropZone, { force: true, noWaitAfter: true });
+                        await frame.waitForTimeout(150); // Minimal settle time for DOM update
+                        availableSources.push(expectedSource); // Mark as used
+                        successCount++;
+                    } else {
+                        console.log(`[SeqDrag] Card ${i + 1}: Could not find source "${expectedSource}"`);
+                    }
+                } catch (e) { console.log(`[SeqDrag] Layout A Row ${i} Error:`, e.message); }
+            }
+
+            let filledCount = 0;
+            for (let i = 0; i < lpCount; i++) {
+                const filled = await labelPairRows.nth(i).locator('.click-select-drop, .rc-label-pair-base__field--empty, [class*="drop"]').first()
+                    .locator('[draggable="true"]').count().catch(() => 0) > 0;
+                if (filled) filledCount++;
+            }
+            return filledCount;
+        }
+
+        // ── Layout B: Standard .prompt-answer-list__item rows ────────────────
+        const rows = frame.locator('.prompt-answer-list__item');
+        const rowCount = await rows.count().catch(() => 0);
+
+        if (rowCount > 0) {
+            console.log(`[SeqDrag] Found ${rowCount} rows — processing sequentially...`);
+            const availableSources = []; // Track sources already dragged (prevents cross-row swapping)
+            for (let i = 0; i < rowCount; i++) {
+                try {
+                    const row = rows.nth(i);
+
+                    // 1. Read label text
+                    const labelText = cleanText(
+                        await row.locator('.rc-prompt-answer-pair__field').first()
+                            .innerText().catch(() => '')
+                    );
+
+                    if (i === 0) console.log(`[SeqDrag] Row 0 Target Identified as: "${labelText}"`);
+
+                    // 2. Fuzzy match pairing
+                    const pairingKey = Object.keys(pairings).find(k => {
+                        const cleanK = cleanText(k);
+                        return cleanK.length > 0 && labelText.length > 0 &&
+                            (cleanK.includes(labelText) || labelText.includes(cleanK) || cleanK === labelText);
+                    });
+
+                    const expectedSource = pairingKey ? cleanText(pairings[pairingKey]) : null;
+                    if (!expectedSource) {
+                        console.log(`[SeqDrag] Row ${i}: No pairing found for "${labelText}" (Mismatch?)`);
+                        continue;
+                    }
+
+                    // 3. Check if already CORRECT (not just filled)
+                    const answerSlot = row.locator('.rc-prompt-answer-pair__field').nth(1);
+                    const currentText = cleanText(await answerSlot.innerText().catch(() => ''));
+                    // Strict text check + check if it actually contains a draggable
+                    const hasDraggable = await answerSlot.locator('[draggable="true"]').count().catch(() => 0) > 0;
+                    if (hasDraggable && currentText === expectedSource) {
+                        console.log(`[SeqDrag] Row ${i} already correct ("${expectedSource}") — skipping`);
+                        availableSources.push(expectedSource); // Mark as used
+                        continue;
+                    }
+
+                    // 4. Find source: First attempt in the "Additional Answers" dock
+                    // Skip any source already claimed by a prior row
+                    const dockDraggables = await frame.locator('.draggable-label-container [draggable="true"]').all();
+                    let sourceEl = null;
+                    for (const src of dockDraggables) {
+                        const txt = cleanText(await src.innerText().catch(() => ''));
+                        if (availableSources.includes(txt)) continue; // Already used
+                        if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
+                            const isVis = await src.isVisible().catch(() => false);
+                            if (isVis) { sourceEl = src; break; }
+                        }
+                    }
+
+                    // Fallback: Any draggable element with matching text (not placed in a target slot)
+                    if (!sourceEl) {
+                        const allSources = await frame.locator('[draggable="true"]').all();
+                        for (const src of allSources) {
+                            const txt = cleanText(await src.innerText().catch(() => ''));
+                            if (availableSources.includes(txt)) continue; // Already used
+                            // Only "placed" if it's in the second field (answer slot) of a row
+                            const isPlaced = await src.evaluate(el => {
+                                const field = el.closest('.rc-prompt-answer-pair__field');
+                                if (!field) return false;
+                                const fields = [...field.parentElement.querySelectorAll('.rc-prompt-answer-pair__field')];
+                                return fields.indexOf(field) === 1;
+                            }).catch(() => false);
+
+                            if (isPlaced) continue;
+
+                            if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
+                                sourceEl = src; break;
+                            }
+                        }
+                    }
+
+                    if (sourceEl) {
+                        console.log(`[SeqDrag] Row ${i}: Dragging "${expectedSource}" to "${labelText}"`);
+                        // Scroll to target first to ensure it's in the interactive area
+                        await answerSlot.scrollIntoViewIfNeeded().catch(() => { });
+                        await sourceEl.dragTo(answerSlot, { force: true, noWaitAfter: true });
+                        await frame.waitForTimeout(150); // Minimal settle time for DOM update
+                        availableSources.push(expectedSource); // Mark as used
+                    } else {
+                        console.log(`[SeqDrag] Row ${i}: Could not find source "${expectedSource}" anywhere`);
+                    }
+                } catch (e) { console.log(`[SeqDrag] Layout B Row ${i} Error:`, e.message); }
+            }
+
+            let filledCount = 0;
+            for (let i = 0; i < rowCount; i++) {
+                const isFilledInUi = await rows.nth(i).locator('.rc-prompt-answer-pair__field').nth(1).evaluate(slot => {
+                    const draggable = slot.querySelector('[draggable="true"]');
+                    return draggable && (draggable.innerText.trim().length > 0 || !!draggable.querySelector('img'));
+                }).catch(() => false);
+                if (isFilledInUi) filledCount++;
+            }
+            return filledCount;
+        }
+
+        return 0;
+    };
+
+
     // 4. GUI Helper functions
+
     const updateGuiStatus = async (status, isOnline = true) => {
         await guiPage.evaluate(({ s, online }) => {
             const statusEl = document.getElementById('status-text');
@@ -185,7 +414,7 @@ const Brain = require('./brain');
                     const items = Array.from(document.querySelectorAll('.rc-nugget-list__item'));
                     const queue = [];
                     items.forEach(item => {
-                        const link = item.querySelector('a[data-testid="nugget-link"]');
+                        const link = item.querySelector('a[data-testid="nugget-link"], a[data-testid="smart-nugget-link"]');
                         const titleEl = item.querySelector('[data-testid="nugget-title"]');
                         const scoreRing = item.querySelector('.rc-percentage-ring--score');
                         const completionRing = item.querySelector('.rc-percentage-ring--completion');
@@ -280,7 +509,8 @@ const Brain = require('./brain');
     await updateGuiStatus('LOGGING IN...');
     await centuryPage.fill('input[name="username"]', config.username || 'Zayan123');
     await centuryPage.fill('input[name="password"]', config.password || 'Zayan123');
-    await centuryPage.click('button[type="submit"]');
+    const loginBtn = await centuryPage.$('button[type="submit"]');
+    await safeClick(loginBtn, 'Login Button');
 
     try {
         await centuryPage.waitForURL('**/learn/**', { timeout: 30000 });
@@ -388,67 +618,7 @@ const Brain = require('./brain');
     // No longer waiting for a single URL to start - the loop handles queue transitions.
     isSolverRunning = false; // Becomes true when an assignment or nugget is started
 
-    // Helper: Safe Click (Improved for robustness)
-    const safeClick = async (element, description = 'Element') => {
-        try {
-            if (element) {
-                await element.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => { });
-                try {
-                    await element.click({ timeout: 3000 });
-                } catch (e) {
-                    console.log(`[SafeClick] Normal click failed for ${description}, forcing...`);
-                    try {
-                        await element.click({ force: true, timeout: 3000 });
-                    } catch (e2) {
-                        console.log(`[SafeClick] Forced click failed, using evaluate(click)...`);
-                        await element.evaluate(el => el.click()).catch(e3 => {
-                            console.log(`[SafeClick] Evaluate failed: ${e3.message}`);
-                        });
-                    }
-                }
-            }
-        } catch (e) {
-            console.log(`[SafeClick] Failed to click ${description}: ${e.message}.`);
-        }
-    };
 
-    // Helper: Batch Drag using Playwright locator.dragTo() for speed
-    const executeBatchDrag = async (frame, pairings) => {
-        let successCount = 0;
-        for (const [targetText, sourceText] of Object.entries(pairings)) {
-            try {
-                const source = frame.locator('.draggable-label-item', { hasText: sourceText }).first();
-                const targetRow = frame.locator('.rc-prompt-answer-pair', { hasText: targetText }).first();
-                const dropZone = targetRow.locator('.rc-prompt-answer-pair__field').nth(1);
-
-                // Skip if source not visible (already placed)
-                if (!(await source.isVisible({ timeout: 500 }).catch(() => false))) {
-                    console.log(`[BatchDrag] Source "${sourceText}" not found/visible, skipping`);
-                    continue;
-                }
-
-                // Skip if drop zone already filled
-                const isFilled = await dropZone.evaluate(el => {
-                    const content = el.querySelector('.matching-answer-draggable__content');
-                    if (!content) return false;
-                    return (content.textContent?.trim().length > 0) || !!content.querySelector('p');
-                }).catch(() => false);
-
-                if (isFilled) {
-                    console.log(`[BatchDrag] "${targetText}" already filled, skipping`);
-                    successCount++;
-                    continue;
-                }
-
-                console.log(`[BatchDrag] Dragging "${sourceText}" → "${targetText}"`);
-                await source.dragTo(dropZone, { force: true });
-                successCount++;
-            } catch (e) {
-                console.log(`[BatchDrag] Failed "${sourceText}" → "${targetText}":`, e.message);
-            }
-        }
-        return successCount;
-    };
 
     // 6. Main Interaction Loop
 
@@ -579,12 +749,7 @@ const Brain = require('./brain');
             let optionElements = [];
             let imageBase64 = null;
 
-            // 1. Initial Checks
-            const spinner = await centuryPage.$('.loading-spinner');
-            if (spinner && await spinner.isVisible()) {
-                await updateGuiStatus('WAITING FOR LOAD...');
-                await centuryPage.waitForSelector('.loading-spinner', { state: 'hidden', timeout: 30000 }).catch(() => null);
-            }
+            // 1. Initial Checks — rely on Playwright actionability; no manual spinner poll needed
 
             // 2. Context Detection
             try {
@@ -636,13 +801,47 @@ const Brain = require('./brain');
                 }
             }
 
+            // --- PRIORITY 1: Immediate Question/Nugget Navigation ---
+            // If a "Next Question" or "Next Nugget" button is visible, we click it immediately.
+            const urgentNextBtn = await currentFrame.$([
+                'button:has-text("Next Question")',
+                'button:has-text("NEXT QUESTION")',
+                'button:has-text("Next Nugget")',
+                'button:has-text("NEXT NUGGET")',
+                '[data-testid="button-next-question"]',
+                '.rc-results [class*="button"]',
+                ':has-text("Next Nugget")'
+            ].join(', '));
+
+            if (urgentNextBtn && await urgentNextBtn.isVisible()) {
+                const btnText = (await urgentNextBtn.innerText().catch(() => '')).toLowerCase();
+                console.log(`[Flow] Urgent Navigation detected ("${btnText.split('\n')[0]}") - clicking...`);
+
+                if (btnText.includes('next nugget')) {
+                    // Try to log score before jumping
+                    let acc = await getNuggetScore(currentFrame);
+                    if (!acc) acc = await getNuggetScore(centuryPage);
+                    await logScore(acc);
+
+                    if (nuggetQueue.length > 0) {
+                        console.log('[Flow] Next Nugget button detected. Jumping queue...');
+                        if (await navigateToNextNugget()) continue;
+                    }
+                }
+
+                await safeClick(urgentNextBtn);
+                lastSolvedFingerprint = '';
+                sameQuestionAttempts = 0;
+                continue;
+            }
+
             // Scraper Logic: Passive background scraping when on assignment lists
             if (centuryPage.url().includes('/assignments/')) {
                 try {
                     const items = await centuryPage.$$('.rc-nugget-list__item');
                     if (items.length > 0) {
                         for (const item of items) {
-                            const link = await item.$('a[data-testid="nugget-link"]');
+                            const link = await item.$('a[data-testid="nugget-link"], a[data-testid="smart-nugget-link"]');
                             const completionRing = await item.$('.rc-percentage-ring--completion');
                             const scoreRing = await item.$('.rc-percentage-ring--score');
 
@@ -680,25 +879,21 @@ const Brain = require('./brain');
                     found.fullText.includes('100%') ||
                     found.fullText.includes('Completion') ||
                     found.fullText.includes('Feedback') ||
+                    found.fullText.toLowerCase().includes('thank you') ||
+                    found.fullText.toLowerCase().includes('completing') ||
                     !!hasFeedbackRef;
 
                 if (isFeedback) {
                     await updateGuiStatus('FEEDBACK DETECTED');
+                    hasAttemptedSolve = true; // Mark as solved since we've seen feedback
 
                     // 1. Prioritize score logging BEFORE overlay dismissal
                     let acc = await getNuggetScore(currentFrame);
                     if (!acc) acc = await getNuggetScore(centuryPage); // Fallback to main page
 
+                    await logScore(acc);
                     if (acc !== null && !isNaN(acc)) {
-                        if (lastLoggedNugget !== nuggetContext) {
-                            console.log(`[Stats] Accuracy Recorded: ${acc}%`);
-                            allScores.push(acc);
-                            fs.appendFileSync(scoresPath, `${acc}\n`);
-                            lastLoggedNugget = nuggetContext;
-                            await updateGuiStats();
-                            await updateGuiStatus('NUGGET COMPLETE!');
-                        }
-
+                        await updateGuiStatus('NUGGET COMPLETE!');
                         // JUMP ON SCORE
                         if (nuggetQueue.length > 0) {
                             console.log('[Flow] Score captured. Jumping to next nugget...');
@@ -711,7 +906,6 @@ const Brain = require('./brain');
                     if (overlays.length > 0 && !acc) {
                         console.log('[Feedback] Dismissing submitted/feedback overlay...');
                         await centuryPage.mouse.click(10, 10);
-                        await centuryPage.waitForTimeout(Math.floor(500 * await getTurboMultiplier()));
                     }
 
                     const nextBtn = await currentFrame.$('button:has-text("Next Nugget"), button:has-text("NEXT NUGGET"), button:has-text("Next Question"), button:has-text("NEXT QUESTION"), button:has-text("Next"), button:has-text("NEXT"), button:has-text("View results"), button:has-text("Continue"), [data-testid="next-button"], [data-testid="button-next-question"]');
@@ -719,7 +913,8 @@ const Brain = require('./brain');
                         const btnText = (await nextBtn.innerText().catch(() => '')).toLowerCase();
                         const isNuggetEnd = btnText.includes('next nugget') ||
                             found.fullText.includes('100%') ||
-                            found.fullText.includes('Completion');
+                            found.fullText.includes('Completion') ||
+                            found.fullText.includes('Thank you for completing the diagnostic');
 
                         if (isNuggetEnd) {
                             if (nuggetQueue.length > 0) {
@@ -735,8 +930,7 @@ const Brain = require('./brain');
                             }
                         }
 
-                        await safeClick(nextBtn, 'Next Button');
-                        await centuryPage.waitForTimeout(await getDelay('nav'));
+                        await safeClick(nextBtn);
                     }
                     continue;
                 }
@@ -810,7 +1004,15 @@ const Brain = require('./brain');
 
                 if (currentFingerprint === lastSolvedFingerprint) {
                     sameQuestionAttempts++;
-                    const timeSpentOnQuestion = (Date.now() - questionStartTime) / 1000; // in seconds
+                    const timeSpentOnQuestion = (Date.now() - questionStartTime) / 1000;
+
+                    // If we've already tried to solve this exact fingerprint once, don't ask the AI again. 
+                    // This prevents infinite matching loops.
+                    if (hasAttemptedSolve) {
+                        if (sameQuestionAttempts % 20 === 0) console.log(`[Flow] Waiting for manual input or Next button (Attempt ${sameQuestionAttempts})...`);
+                        await centuryPage.waitForTimeout(1000);
+                        continue;
+                    }
 
                     // Log only every 10 attempts to reduce noise, unless time is high
                     if (sameQuestionAttempts % 10 === 0 || timeSpentOnQuestion > 5) {
@@ -823,14 +1025,20 @@ const Brain = require('./brain');
                     const threshold = baseThreshold * (turboLevel / 2);
                     const hardTimeout = isMatchingQuestion ? 180 : 60; // 3 mins matching, 60s standard (reduced from 90s)
 
+                    if (sameQuestionAttempts > 5 && sameQuestionAttempts % 5 === 0) {
+                        console.log(`[Flow] Persistent Fingerprint Detect (${sameQuestionAttempts} attempts). Hard Refreshing...`);
+                        await centuryPage.reload().catch(() => { });
+                        await centuryPage.waitForTimeout(3000);
+                        continue;
+                    }
+
                     if (sameQuestionAttempts > threshold || timeSpentOnQuestion > hardTimeout) {
                         console.log(`[Flow] STUCK DETECTED (${sameQuestionAttempts} attempts, ${timeSpentOnQuestion.toFixed(1)}s). Attempting to skip...`);
                         await updateGuiStatus('STUCK - SKIPPING...');
 
                         const idkBtn = await currentFrame.$('button:has-text("I don\'t know"), button:has-text("I Don\'t Know"), [data-testid="idk-button"]');
                         if (idkBtn && await idkBtn.isVisible()) {
-                            await safeClick(idkBtn, "I Don't Know Button");
-                            await centuryPage.waitForTimeout(await getDelay('nav'));
+                            await safeClick(idkBtn);
                             sameQuestionAttempts = 0;
                             questionStartTime = Date.now();
                             hasAttemptedSolve = false;
@@ -841,8 +1049,7 @@ const Brain = require('./brain');
 
                     const nextBtn = await currentFrame.$('[data-testid="button-next-question"], button.btn--secondary:has-text("Next Question")');
                     if (nextBtn && await nextBtn.isVisible()) {
-                        await safeClick(nextBtn, 'Immediate Next Button');
-                        await centuryPage.waitForTimeout(1000); // 1s cooldown even in Turbo
+                        await safeClick(nextBtn);
                         continue;
                     }
 
@@ -871,29 +1078,39 @@ const Brain = require('./brain');
                 let response = null;
 
                 if (isAutoSolve) {
+                    // One-shot solve: don't call AI again if we already have for this question
+                    if (hasAttemptedSolve && currentFingerprint === lastSolvedFingerprint) {
+                        await centuryPage.waitForTimeout(1000);
+                        continue;
+                    }
+
                     await updateGuiStatus('AI THINKING...');
                     await centuryPage.waitForTimeout(await getDelay('thinking'));
 
                     if (isMatching) {
                         // 1. Fast DOM scrape: extract all target labels and source texts
+                        // Use textContent (not innerText) to match what the RegExp locator sees
                         let targetTexts = await currentFrame.evaluate(() => {
                             return [...document.querySelectorAll('.rc-prompt-answer-pair')].map(row => {
                                 const fields = row.querySelectorAll('.rc-prompt-answer-pair__field');
-                                return fields[0]?.innerText?.trim() || '';
+                                return fields[0]?.textContent || '';
                             }).filter(Boolean);
                         });
+                        targetTexts = targetTexts.map(cleanText);
 
                         let sourceTexts = await currentFrame.evaluate(() => {
                             return [...document.querySelectorAll('.draggable-label-item[draggable="true"]')].map(el => {
-                                return el.innerText?.trim() || '';
+                                return el.innerText || '';
                             }).filter(Boolean);
                         });
+                        sourceTexts = sourceTexts.map(cleanText);
 
-                        // Fallback: Label Pair List layout
+                        // Fallback: Label Pair List layout (Matching v2 / Labelling)
                         if (targetTexts.length === 0) {
                             targetTexts = await currentFrame.evaluate(() => {
                                 return [...document.querySelectorAll('.rc-label-pair-list__item')].map((item, i) => {
-                                    return item.innerText?.trim() || `[Target Card ${i + 1}]`;
+                                    // Positional key is best for labelling tasks to avoid confusion with placed text
+                                    return `Card ${i + 1}`;
                                 });
                             });
                         }
@@ -912,46 +1129,87 @@ const Brain = require('./brain');
                             sourceTexts = await currentFrame.evaluate(() => {
                                 const seen = new Set();
                                 return [...document.querySelectorAll('[draggable="true"], .draggable-label-item, .matching-additional-list__item, div[class*="draggable"], .co-drag-drop-source')].map(el => {
-                                    const txt = el.innerText?.trim() || '';
+                                    const txt = el.innerText || '';
                                     if (txt && !seen.has(txt)) { seen.add(txt); return txt; }
                                     return '';
                                 }).filter(Boolean);
                             });
+                            sourceTexts = sourceTexts.map(cleanText);
+                        }
+
+                        // Robust Skip Detection for Image-only Matching
+                        const draggablesCount = await currentFrame.locator('[draggable="true"]').count().catch(() => 0);
+                        if (isMatching && draggablesCount > 0 && sourceTexts.length === 0) {
+                            console.log(`[Matching] Image-only layout detected (${draggablesCount} draggables found with no text labels). Skipping...`);
+                            const idkBtn = await currentFrame.$('button:has-text("I don\'t know"), [data-testid="button-skip"], button:has-text("skip"), button:has-text("Skip")');
+                            if (idkBtn) {
+                                await safeClick(idkBtn, 'I Don\'t Know');
+                                await centuryPage.waitForTimeout(2000);
+                                lastSolvedFingerprint = currentFingerprint;
+                                sameQuestionAttempts = 0;
+                                continue;
+                            } else {
+                                console.log('[Matching] Skip requested but "I don\'t know" button not found.');
+                            }
                         }
 
                         if (targetTexts.length > 0 && sourceTexts.length > 0) {
                             const turboLevel = await guiPage.evaluate(() => parseInt(document.getElementById('turbo-slider')?.value || '1'));
                             const brainModel = turboLevel > 10 ? 'gpt-4o-mini' : 'gpt-4o';
 
-                            const pairs = await Brain.solveMatching(targetTexts, sourceTexts, config.openai_api_key, nuggetContext, imageBase64, brainModel);
+                            let pairs = await Brain.solveMatching(targetTexts, sourceTexts, config.openai_api_key, nuggetContext, imageBase64, brainModel);
+                            await centuryPage.waitForTimeout(1500); // Optimized cooldown
+
+                            if (pairs === "rate_limit" || (typeof pairs === 'string' && pairs.includes('429'))) {
+                                console.log('[Matching] Rate limit hit. Backing off 10s...');
+                                await updateGuiStatus('RATE LIMITED (10s)...');
+                                await centuryPage.waitForTimeout(10000);
+                                continue;
+                            }
                             if (pairs) {
-                                console.log(`[Matching] Batch processing ${Object.keys(pairs).length} pairs...`);
+                                hasAttemptedSolve = true;
+                                // Clean all keys and values in pairings
+                                const cleanPairs = {};
+                                for (const [k, v] of Object.entries(pairs)) {
+                                    cleanPairs[cleanText(k)] = cleanText(v);
+                                }
+                                pairs = cleanPairs;
 
-                                // 2. Execute all drags in one fast batch
-                                const filled = await executeBatchDrag(currentFrame, pairs);
-
-                                // 3. Instant DOM verification
-                                const allFilled = await currentFrame.evaluate(() => {
-                                    const rows = document.querySelectorAll('.rc-prompt-answer-pair');
-                                    if (rows.length === 0) return true; // Non-standard layout, trust the drag
-                                    return [...rows].every(row => {
-                                        const dropZone = row.querySelectorAll('.rc-prompt-answer-pair__field')[1];
-                                        if (!dropZone) return true;
-                                        const content = dropZone.querySelector('.matching-answer-draggable__content');
-                                        return content && (content.textContent?.trim().length > 0 || !!content.querySelector('p'));
-                                    });
+                                const totalPairs = Object.keys(pairs).length;
+                                // Determine expected target count from the UI
+                                const expectedTargetCount = await currentFrame.evaluate(() => {
+                                    const layoutA = document.querySelectorAll('.rc-label-pair-list__item').length;
+                                    const layoutB = document.querySelectorAll('.prompt-answer-list__item').length;
+                                    return Math.max(layoutA, layoutB, 0);
                                 });
 
-                                if (allFilled) {
-                                    console.log(`[Matching] ✓ All ${filled} pairs verified`);
-                                } else {
-                                    console.log(`[Matching] ⚠ Some pairs may need retry, running second pass...`);
-                                    await executeBatchDrag(currentFrame, pairs);
-                                }
+                                console.log(`[Matching] Processing ${totalPairs} pairs sequentially... (Expected Targets: ${expectedTargetCount})`);
 
-                                const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
-                                if (submitBtn) await safeClick(submitBtn, 'Submit');
-                                lastSolvedFingerprint = currentFingerprint; continue;
+                                // 2. Sequential drag — one row at a time
+                                const filledCount = await executeSequentialDrag(currentFrame, pairs);
+
+
+
+                                // 3. Robust HTML-based result check
+                                // We are done if we've filled at least as many as the AI told us AND at least as many as are on screen
+                                if (filledCount >= totalPairs && filledCount >= expectedTargetCount) {
+                                    console.log(`[Matching] ✓ ${filledCount} rows filled — submitting`);
+                                    const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
+                                    if (submitBtn) await safeClick(submitBtn);
+                                    lastSolvedFingerprint = currentFingerprint; continue;
+                                } else {
+                                    console.log(`[Matching] ✗ Only ${filledCount}/${totalPairs} rows filled — retrying next loop`);
+                                    sameQuestionAttempts++;
+                                    if (sameQuestionAttempts >= 3) {
+                                        console.log('[Matching] Persistent failure. Refreshing...');
+                                        await updateGuiStatus('REFRESHING (GLITCH)...');
+                                        await centuryPage.reload();
+                                        lastSolvedFingerprint = '';
+                                        sameQuestionAttempts = 0;
+                                        await centuryPage.waitForTimeout(5000);
+                                        continue;
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -975,21 +1233,35 @@ const Brain = require('./brain');
                     if (response.type === 'index') {
                         const idx = response.value - 1;
                         if (optionElements[idx]) {
-                            await safeClick(optionElements[idx], `Option ${idx + 1}`);
-                            await centuryPage.waitForTimeout(Math.floor(500 * await getTurboMultiplier()));
+                            await safeClick(optionElements[idx]);
                             const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
-                            if (submitBtn) await safeClick(submitBtn, 'Submit');
+                            if (submitBtn) await safeClick(submitBtn);
                         }
                     } else {
                         // TEXT ANSWER HANDLING
                         console.log(`[Text Mode] Response: "${response.value}"`);
 
-                        // 1. Try Standard Inputs
-                        const ti = await currentFrame.$('input[type="text"], input[type="number"], textarea');
-                        if (ti && await ti.isVisible()) {
-                            await ti.fill(response.value);
+                        // BRIDGE: If text response matches an MCQ option precisely, use index click
+                        const textMatchIdx = options.findIndex(opt =>
+                            opt === response.value ||
+                            opt.toLowerCase() === response.value.toLowerCase() ||
+                            opt.replace(/\D/g, '') === response.value.replace(/\D/g, '') // match digit strings like "4" to " 4 "
+                        );
+
+                        if (textMatchIdx !== -1 && optionElements[textMatchIdx]) {
+                            console.log(`[Text Mode] Value "${response.value}" matches Option ${textMatchIdx + 1}. Clicking...`);
+                            await safeClick(optionElements[textMatchIdx]);
                             const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
-                            if (submitBtn) await safeClick(submitBtn, 'Submit');
+                            if (submitBtn) await safeClick(submitBtn);
+                        }
+                        // 1. Try Standard Inputs
+                        else if (await currentFrame.$('input[type="text"], input[type="number"], textarea')) {
+                            const ti = await currentFrame.$('input[type="text"], input[type="number"], textarea');
+                            if (ti && await ti.isVisible()) {
+                                await ti.fill(response.value);
+                                const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
+                                if (submitBtn) await safeClick(submitBtn);
+                            }
                         }
                         // 1.5. Try Dropdowns / Selects
                         else if (await currentFrame.$('select, .rc-dropdown, .rc-dropdown__toggle, [data-testid="dropdown-trigger"], [role="combobox"], .rc-select')) {
@@ -1003,22 +1275,20 @@ const Brain = require('./brain');
                                     await dropdown.selectOption({ label: response.value }).catch(() => dropdown.selectOption({ value: response.value })).catch(() => { });
                                 } else {
                                     // Custom Dropdown (click to open, then select)
-                                    await safeClick(dropdown, 'Dropdown Trigger');
-                                    await centuryPage.waitForTimeout(Math.floor(500 * await getTurboMultiplier()));
+                                    await safeClick(dropdown);
 
                                     // Try exact match first
                                     const option = currentFrame.getByText(response.value, { exact: true }).first();
                                     if (await option.isVisible()) {
-                                        await option.click();
+                                        await safeClick(option);
                                     } else {
                                         // Case-insensitive fallback
                                         const optionCi = currentFrame.getByText(response.value, { exact: false }).first();
-                                        if (await optionCi.isVisible()) await optionCi.click();
+                                        if (await optionCi.isVisible()) await safeClick(optionCi);
                                     }
                                 }
-                                await centuryPage.waitForTimeout(Math.floor(500 * await getTurboMultiplier()));
                                 const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
-                                if (submitBtn) await safeClick(submitBtn, 'Submit');
+                                if (submitBtn) await safeClick(submitBtn);
                             }
                         }
                         // 2. Try Guppy Math
@@ -1029,8 +1299,7 @@ const Brain = require('./brain');
                                 if (await g.isVisible()) { guppy = g; break; }
                             }
                             if (guppy) {
-                                await safeClick(guppy, 'Guppy Math Input');
-                                await centuryPage.waitForTimeout(Math.floor(500 * await getTurboMultiplier())); // Init delay
+                                await safeClick(guppy);
                                 await guppy.focus().catch(() => { });
                                 await guppy.evaluate(el => el.focus()).catch(() => { }); // Dual focus strategy
                                 await centuryPage.keyboard.type(response.value, { delay: 50 });
@@ -1043,14 +1312,24 @@ const Brain = require('./brain');
                         else {
                             console.log('[Fallback] No inputs found. Attempting to click element by text...');
                             try {
-                                const textElement = currentFrame.getByText(response.value, { exact: false }).first();
+                                // Scoped search inside question container is more reliable
+                                const textElement = questionContainer.getByText(response.value, { exact: false }).first();
                                 if (await textElement.isVisible()) {
-                                    await textElement.click();
-                                    await centuryPage.waitForTimeout(Math.floor(500 * await getTurboMultiplier()));
+                                    await safeClick(textElement);
+                                    await centuryPage.waitForTimeout(500);
                                     const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
-                                    if (submitBtn) await safeClick(submitBtn, 'Submit via Fallback');
+                                    if (submitBtn) await safeClick(submitBtn);
                                 } else {
-                                    console.log('[Fallback] Text element not visible.');
+                                    // Extreme fallback: any text match in frame
+                                    const broadMatch = currentFrame.getByText(response.value, { exact: false }).first();
+                                    const isVis = await broadMatch.isVisible().catch(() => false);
+                                    if (isVis) {
+                                        await safeClick(broadMatch);
+                                        const submitBtn = await currentFrame.$('button.btn--secondary:has-text("SUBMIT ANSWER"), button.btn--secondary:has-text("Submit Answer"), [data-testid="button-submit"], button:has-text("SUBMIT ANSWER"), button:has-text("Submit Answer")');
+                                        if (submitBtn) await safeClick(submitBtn);
+                                    } else {
+                                        console.log('[Fallback] Text element not visible even in broad search.');
+                                    }
                                 }
                             } catch (e) {
                                 console.log('[Fallback] Failed to find/click text element:', e.message);
@@ -1059,10 +1338,8 @@ const Brain = require('./brain');
                     }
                 }
 
-                await centuryPage.waitForTimeout(await getDelay('feedback'));
                 const cont = await currentFrame.$('button.btn--secondary:has-text("NEXT QUESTION"), button.btn--secondary:has-text("Next Question"), button.btn--secondary:has-text("CONTINUE"), [data-testid="button-next-question"]');
-                if (cont) await safeClick(cont, 'Continue');
-                await centuryPage.waitForTimeout(await getDelay('nav'));
+                if (cont) await safeClick(cont);
             } else {
                 // NOT FOUND: Skips & Results
                 const skip = await guiPage.evaluate(() => document.getElementById('skip-lessons')?.checked || false);
@@ -1072,30 +1349,36 @@ const Brain = require('./brain');
                     const q = await centuryPage.$('.rc-learning-question, .multi-question__question');
                     if (!q || !(await q.isVisible())) {
                         await updateGuiStatus('SKIPPING LESSON...');
-                        await safeClick(btn, 'Skip'); lastSolvedFingerprint = '';
+                        await safeClick(btn); lastSolvedFingerprint = '';
                     }
                 } else {
                     // Check for Results/Next Nugget
-                    const res = await centuryPage.$('h2:has-text("Results"), .rc-results__score, [class*="results"], button:has-text("Next Nugget"), button:has-text("View results")');
+                    const resSelector = [
+                        'h2:has-text("Results")',
+                        '.rc-results__score',
+                        '[class*="results"]',
+                        'button:has-text("Next Nugget")',
+                        'button:has-text("View results")',
+                        ':has-text("Thank you for completing")',
+                        ':has-text("completing the diagnostic")'
+                    ].join(', ');
+
+                    const res = await centuryPage.$(resSelector);
                     if (res && await res.isVisible()) {
-                        const btnText = (await res.innerText().catch(() => '')).toLowerCase();
-                        if (btnText.includes('view results')) {
+                        const resText = (await res.innerText().catch(() => '')).toLowerCase();
+                        if (resText.includes('view results')) {
                             await safeClick(res, 'View Results');
                             await centuryPage.waitForTimeout(Math.floor(2000 * await getTurboMultiplier()));
                         }
 
                         // Log accuracy
                         const scoreVal = await getNuggetScore(centuryPage);
-                        if (scoreVal !== null && !isNaN(scoreVal)) {
-                            if (lastLoggedNugget !== nuggetContext) {
-                                allScores.push(scoreVal);
-                                fs.appendFileSync(scoresPath, `${scoreVal}\n`);
-                                console.log(`[Stats] Logged Score: ${scoreVal}%`);
-                                lastLoggedNugget = nuggetContext;
-                                await updateGuiStats();
-                            }
+                        await logScore(scoreVal);
 
-                            // JUMP ON SCORE
+                        // JUMP ON SCORE OR THANK YOU SCREEN
+                        const isThankYou = resText.includes('thank you') || resText.includes('completing');
+
+                        if ((scoreVal !== null && !isNaN(scoreVal)) || isThankYou) {
                             if (nuggetQueue.length > 0) {
                                 console.log('[Flow] Results screen detected. Jumping to next nugget...');
                                 if (await navigateToNextNugget()) continue;

@@ -1,61 +1,89 @@
 # Centiant 🚀
 
-Centiant is a high-speed automation and solving tool for the Century Tech platform. It combines Playwright-based browser automation with OpenAI's GPT-4o to provide accurate, distributed solving for various question types, including complex drag-and-drop matching.
+Centiant is a high-speed automation and solving tool for the Century Tech platform. It combines Playwright-based browser automation with OpenAI's GPT-4o to provide accurate, distributed solving across multiple interfaces.
 
-## ✨ Features
+## 🌟 Interface Modes
 
-- **Multi-Tab Dashboard:** A dual-tab interface with a live GUI on one side and the automated Century Tech session on the other.
-- **Advanced Matching Logic:** Custom `safeDrag` implementation with a 3-attempt verification loop to ensure 100% completion on matching questions.
-- **Intelligent Scraping:** Robust nugget detection with white-screen recovery and multi-attempt retry logic.
-- **Comprehensive Question Support:** Handles Multiple Choice (MCQ), Text Input, and Drag & Drop questions.
-- **Security-First:** Credential management via environment variables (`.env`) to keep your API keys and login details out of version control.
-- **Detailed Analytics:** Tracks accuracy and provides a live queue of nuggets to be solved.
+Centiant can be operated in two distinct ways:
+
+### 1. Discord Bot (Main)
+A multi-user bot that allows you to manage assignments, scan for due work, and solve nuggets remotely via Discord commands. Features include:
+- **Redemption System**: Access control via 12-digit keys.
+- **Account Locking**: Securely link your Century credentials to your Discord ID.
+- **Assignment Browser**: View due assignments and specific nuggets directly in Discord.
+- **Live Monitoring**: High-speed solver reporting progress and scores via embeds.
+
+### 2. Standalone GUI (Inside `/gui`)
+A local browser-based dashboard intended for individual use. 
+- **Dual Tabs**: Watch the solver work in real-time alongside a live control panel.
+- **Manual Control**: Directly manage the solver flight from your desktop.
+
+---
 
 ## 🛠️ Prerequisites
 
-- [Node.js](https://nodejs.org/) (v16 or higher)
-- NPM (comes with Node)
-- An OpenAI API Key
+- **Python 3.10+** (For the Discord Bot)
+- **Node.js v18+** (For the Solver Engine)
+- **Playwright** (Browser automation)
+- **OpenAI API Key** (For AI-powered solving)
 
 ## 🚀 Installation
 
-1. **Clone the repository:**
+1. **Clone & Enter Folder**
    ```bash
    git clone https://github.com/zayan-py/Centiant.git
    cd Centiant
    ```
 
-2. **Install dependencies:**
+2. **Install Engine Dependencies (Node.js)**
    ```bash
    npm install
    npx playwright install chromium
    ```
 
-## ⚙️ Configuration
-
-1. **Setup Environment Variables:**
-   Rename `.env.example` to `.env` and fill in your details:
+3. **Install Bot Dependencies (Python)**
    ```bash
-   cp .env.example .env
+   pip install -r requirements.txt
    ```
-   Edit `.env`:
-   ```env
-   OPENAI_API_KEY=your_openai_key_here
-   CENTURY_USERNAME=your_username
-   CENTURY_PASSWORD=your_password
-   ```
+
+4. **Environment Setup**
+   Rename `.env.example` to `.env` and fill in your details:
+   - `DISCORD_TOKEN`: Your bot token from the [Discord Developer Portal](https://discord.com/developers/applications).
+   - `OPENAI_API_KEY`: Your OpenAI key.
+
+---
 
 ## 🎯 Usage
 
-To start Centiant, simply run the batch file:
+### Running the Discord Bot
 ```bash
-run.bat
-```
-Alternatively, launch it via Node:
-```bash
-node century_solver.js
+python bot.py
 ```
 
-## 🛡️ License
+### Running the Standalone GUI
+Navigate to the `gui` folder and run:
+```bash
+gui/run.bat
+```
 
-This project is licensed under the ISC License.
+---
+
+## 📁 Repository Structure
+
+```text
+Centiant/
+├── gui/                # Standalone GUI files (index.html, css)
+├── bot.py              # Main Discord Bot script
+├── century_solver.js   # The core automation engine
+├── scraper.js          # Assignment/Nugget scanner
+├── auth_check.js       # Credential validator
+├── database.py         # SQLite user management
+└── keys.csv            # (Ignored) Access keys
+```
+
+## 🛡️ Privacy & Security
+- **Strict .gitignore**: User databases (`users.db`), sensitive credentials (`.env`), and access keys (`keys.csv`) are strictly excluded from the repository.
+- **Headless Mode**: The bot runs in headless mode to maximize server resources.
+
+## ⚖️ License
+This project is for educational and testing purposes only. Use responsibly.

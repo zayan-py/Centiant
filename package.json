@@ -1,7 +1,7 @@
 {
-  "name": "century-standalone",
+  "name": "centiant",
   "version": "1.0.0",
-  "description": "This is a standalone version of the high-speed automation tool for Century Tech. It is designed to be run directly on your computer.",
+  "description": "High-speed automation tool for Century Tech.",
   "main": "century_solver.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"

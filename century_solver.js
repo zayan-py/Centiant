@@ -18,16 +18,17 @@ const Brain = require('./brain');
         console.log('[Config] WARNING: No OpenAI API Key found in .env!');
     }
 
-    // 2. Launch Browser with two tabs
+    // 2. Launch Browser (Headless for Bot execution)
+    const isHeadless = process.env.HEADLESS !== 'false';
     const browser = await chromium.launch({
-        headless: false,
-        args: ['--start-maximized']
+        headless: isHeadless,
+        args: isHeadless ? [] : ['--start-maximized']
     });
-    const context = await browser.newContext({ viewport: null });
+    const context = await browser.newContext({ viewport: isHeadless ? { width: 1280, height: 720 } : null });
 
     // TAB 1: Dashboard GUI
     const guiPage = await context.newPage();
-    const guiFilePath = path.join(__dirname, 'index.html').replace(/\\/g, '/');
+    const guiFilePath = path.join(__dirname, 'gui', 'index.html').replace(/\\/g, '/');
     const guiUrl = `file:///${guiFilePath}`;
     console.log(`Loading Dashboard from: ${guiUrl}`);
     await guiPage.goto(guiUrl);
@@ -83,6 +84,8 @@ const Brain = require('./brain');
     const logScore = async (acc) => {
         if (acc !== null && !isNaN(acc) && lastLoggedNugget !== nuggetContext) {
             console.log(`[Stats] Accuracy Recorded: ${acc}%`);
+            // BOT SYNC: Output special progress token
+            console.log(`PROGRESS: SCORE:${acc}`);
             allScores.push(acc);
             fs.appendFileSync(scoresPath, `${acc}\n`);
             lastLoggedNugget = nuggetContext;
@@ -677,6 +680,8 @@ const Brain = require('./brain');
 
         const nextUrl = nuggetQueue.shift();
         console.log(`[Queue] Moving to next nugget. ${nuggetQueue.length} remaining.`);
+        // BOT SYNC: Output special progress token
+        console.log(`PROGRESS: NEXT_NUGGET:${nuggetQueue.length}`);
         await updateGuiStats();
         await updateGuiStatus('LOADING NEXT NUGGET...');
 
@@ -1150,8 +1155,10 @@ const Brain = require('./brain');
                         targetTexts = targetTexts.map(cleanText);
 
                         let sourceTexts = await currentFrame.evaluate(() => {
+                            const blacklist = ['additional answers', 'drag and drop', 'prompt', 'answer', 'target'];
                             return [...document.querySelectorAll('.draggable-label-item[draggable="true"]')].map(el => {
-                                return el.innerText || '';
+                                const txt = (el.innerText || '').trim();
+                                return (!blacklist.includes(txt.toLowerCase())) ? txt : '';
                             }).filter(Boolean);
                         });
                         sourceTexts = sourceTexts.map(cleanText);
@@ -1181,9 +1188,13 @@ const Brain = require('./brain');
                                 const seen = new Set();
                                 const draggables = document.querySelectorAll('[draggable="true"], .draggable-label-item, .matching-additional-list__item, [class*="draggable"], .co-drag-drop-source, .rc-label-pair-base__field');
                                 return [...draggables].map(el => {
-                                    // Get text from el or any child span/div
                                     const txt = (el.innerText || el.textContent || '').trim();
-                                    if (txt && !seen.has(txt)) { seen.add(txt); return txt; }
+                                    // Skip common boilerplate or header text
+                                    const blacklist = ['additional answers', 'drag and drop', 'prompt', 'answer', 'target'];
+                                    if (txt && !seen.has(txt) && !blacklist.includes(txt.toLowerCase())) {
+                                        seen.add(txt);
+                                        return txt;
+                                    }
                                     return '';
                                 }).filter(Boolean);
                             });

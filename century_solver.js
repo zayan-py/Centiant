@@ -5,33 +5,17 @@ const path = require('path');
 const Brain = require('./brain');
 
 (async () => {
-    // 1. Load config
-    // Prioritize .env variables, then fallback to config.json
-    let config = {
+    // 1. Load config from .env (required)
+    const config = {
         username: process.env.CENTURY_USERNAME || "",
         password: process.env.CENTURY_PASSWORD || "",
         openai_api_key: process.env.OPENAI_API_KEY || ""
     };
 
-    const configPath = path.join(__dirname, 'config.json');
-    if (fs.existsSync(configPath)) {
-        try {
-            const fileConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-            // Only use config.json values if they aren't already set by .env
-            if (!config.username && fileConfig.username) config.username = fileConfig.username;
-            if (!config.password && fileConfig.password) config.password = fileConfig.password;
-            if (!config.openai_api_key && fileConfig.openai_api_key) config.openai_api_key = fileConfig.openai_api_key;
-
-            console.log('Loaded credentials (using .env with config.json fallback)');
-        } catch (e) {
-            console.log('Error reading config.json, using .env defaults.');
-        }
-    }
-
     if (config.openai_api_key) {
         console.log(`[Config] Using API Key ending in: ...${config.openai_api_key.slice(-4)}`);
     } else {
-        console.log('[Config] WARNING: No OpenAI API Key found!');
+        console.log('[Config] WARNING: No OpenAI API Key found in .env!');
     }
 
     // 2. Launch Browser with two tabs
@@ -62,10 +46,12 @@ const Brain = require('./brain');
     let hasAttemptedSolve = false;
     let isMatchingQuestion = false;
     let lastLoggedNugget = '';
-    let nuggetContext = '';
+    let nuggetContext = ''
     let nuggetQueue = [];
     let allScores = [];
     let isSolverRunning = false;
+    let lastActivityTime = Date.now();   // Stale page watchdog
+    let sessionStartTime = Date.now();   // For session report
 
     // 1b. Load Persistent Scores
     const scoresPath = path.join(__dirname, 'scores.csv');
@@ -87,7 +73,10 @@ const Brain = require('./brain');
     // Helper: High-speed direct click bypassing human-like scrolling
     const safeClick = async (locator) => {
         if (!locator) return;
-        await locator.click({ force: true, timeout: 2000 }).catch(() => { });
+        try {
+            // JS injection click is often more reliable in high-speed automation
+            await locator.evaluate(el => el.click()).catch(() => locator.click({ force: true, timeout: 1000 }));
+        } catch (e) { }
     };
 
     // Helper: Deduplicated score logger
@@ -97,6 +86,7 @@ const Brain = require('./brain');
             allScores.push(acc);
             fs.appendFileSync(scoresPath, `${acc}\n`);
             lastLoggedNugget = nuggetContext;
+            lastActivityTime = Date.now(); // Activity: nugget finished
             await updateGuiStats();
         }
     };
@@ -201,8 +191,8 @@ const Brain = require('./brain');
             return filledCount;
         }
 
-        // ── Layout B: Standard .prompt-answer-list__item rows ────────────────
-        const rows = frame.locator('.prompt-answer-list__item');
+        // ── Layout B: Standard matching rows (v1 & v2 variations) ─────────
+        const rows = frame.locator('.prompt-answer-list__item, .rc-prompt-answer-pair');
         const rowCount = await rows.count().catch(() => 0);
 
         if (rowCount > 0) {
@@ -220,11 +210,12 @@ const Brain = require('./brain');
 
                     if (i === 0) console.log(`[SeqDrag] Row 0 Target Identified as: "${labelText}"`);
 
-                    // 2. Fuzzy match pairing
+                    // 2. Fuzzy match pairing (Aggressive: strip symbols/arrows for comparison)
                     const pairingKey = Object.keys(pairings).find(k => {
-                        const cleanK = cleanText(k);
-                        return cleanK.length > 0 && labelText.length > 0 &&
-                            (cleanK.includes(labelText) || labelText.includes(cleanK) || cleanK === labelText);
+                        const cleanK = cleanText(k).replace(/[^a-z0-9]/g, '');
+                        const cleanL = labelText.replace(/[^a-z0-9]/g, '');
+                        return cleanK.length > 0 && cleanL.length > 0 &&
+                            (cleanK.includes(cleanL) || cleanL.includes(cleanK) || cleanK === cleanL);
                     });
 
                     const expectedSource = pairingKey ? cleanText(pairings[pairingKey]) : null;
@@ -596,21 +587,16 @@ const Brain = require('./brain');
             };
         }
 
-        const slider = document.getElementById('turbo-slider');
-        const display = document.getElementById('turbo-level-display');
+        const turboToggle = document.getElementById('turbo-toggle');
         const hint = document.getElementById('turbo-hint');
 
-        if (slider && display && hint) {
-            slider.oninput = () => {
-                const val = parseInt(slider.value);
-                display.innerText = val + 'x';
-
-                if (val === 1) hint.innerText = "Standard speed. Reliable and human-like.";
-                else if (val < 5) hint.innerText = "Fast. Good for clearing assignments quickly.";
-                else if (val < 10) hint.innerText = "Hyper. Starting to push browser limits.";
-                else if (val < 15) hint.innerText = "Sonic. May cause minor UI glitches.";
-                else if (val < 20) hint.innerText = "Extreme. Zero-delay execution.";
-                else hint.innerText = "MAX TURBO. Absolute maximum software speed.";
+        if (turboToggle && hint) {
+            turboToggle.onchange = () => {
+                const isMax = turboToggle.checked;
+                hint.innerText = isMax
+                    ? "MAX TURBO. Absolute maximum software speed."
+                    : "Standard speed. Reliable and human-like.";
+                hint.style.color = isMax ? "#ff4d4d" : "#888";
             };
         }
     });
@@ -641,11 +627,8 @@ const Brain = require('./brain');
     });
 
     const getDelay = async (type) => {
-        const turboLevel = await guiPage.evaluate(() => parseInt(document.getElementById('turbo-slider')?.value || '1'));
-
-        // Matching questions no longer need forced slow delays (using locator.dragTo)
-
-        const multiplier = Math.pow(10, -(turboLevel - 1) / 6);
+        const isTurbo = await guiPage.evaluate(() => document.getElementById('turbo-toggle')?.checked || false);
+        const multiplier = isTurbo ? 0.01 : 1.0;
 
         switch (type) {
             case 'thinking': return Math.max(1, Math.floor(1500 * multiplier));
@@ -656,17 +639,39 @@ const Brain = require('./brain');
     };
 
     const getTurboMultiplier = async () => {
-        const turboLevel = await guiPage.evaluate(() => parseInt(document.getElementById('turbo-slider')?.value || '1'));
-        // Matching questions now use batch dragTo, no throttle needed
-        return Math.pow(10, -(turboLevel - 1) / 6);
+        const isTurbo = await guiPage.evaluate(() => document.getElementById('turbo-toggle')?.checked || false);
+        return isTurbo ? 0.01 : 1.0;
+    };
+
+    // Session Summary & Auto-Terminate
+    const terminateSession = async () => {
+        const elapsed = Math.round((Date.now() - sessionStartTime) / 1000);
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed % 60;
+        const avgAcc = allScores.length > 0
+            ? Math.round(allScores.reduce((a, b) => a + b, 0) / allScores.length)
+            : 0;
+
+        const report = `✅ SESSION COMPLETE\n${allScores.length} nuggets | Avg Accuracy: ${avgAcc}% | Time: ${mins}m ${secs}s`;
+        console.log(`\n[Session] ${report}`);
+        await updateGuiStatus(report);
+
+        // Show report in GUI
+        await guiPage.evaluate((msg) => {
+            const el = document.getElementById('question-text');
+            if (el) el.innerText = msg;
+        }, report).catch(() => { });
+
+        await centuryPage.waitForTimeout(3000);
+        await browser.close();
+        process.exit(0);
     };
 
     // Navigate to Next Nugget in Queue
     const navigateToNextNugget = async () => {
         if (nuggetQueue.length === 0) {
-            console.log('[Queue] No more nuggets in queue.');
-            await updateGuiStatus('ALL NUGGETS COMPLETE!');
-            isSolverRunning = false;
+            console.log('[Queue] No more nuggets in queue. Terminating session...');
+            await terminateSession();
             return false;
         }
 
@@ -675,17 +680,33 @@ const Brain = require('./brain');
         await updateGuiStats();
         await updateGuiStatus('LOADING NEXT NUGGET...');
 
-        try {
-            await centuryPage.goto(nextUrl, { waitUntil: 'load', timeout: 60000 });
-            lastSolvedFingerprint = '';
-            nuggetContext = '';
-            sameQuestionAttempts = 0;
-            await centuryPage.waitForTimeout(Math.floor(1500 * await getTurboMultiplier()));
-            return true;
-        } catch (e) {
-            console.error('[Queue] Failed to navigate:', e.message);
-            return false;
+        // Feature 6: Auto-retry navigation up to 3 times
+        let navSuccess = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                await centuryPage.goto(nextUrl, { waitUntil: 'load', timeout: 60000 });
+                navSuccess = true;
+                break;
+            } catch (e) {
+                console.warn(`[Queue] Navigation attempt ${attempt}/3 failed: ${e.message}`);
+                if (attempt < 3) {
+                    await centuryPage.waitForTimeout(5000);
+                }
+            }
         }
+
+        if (!navSuccess) {
+            console.error('[Queue] All 3 navigation attempts failed. Skipping nugget.');
+            return nuggetQueue.length > 0 ? navigateToNextNugget() : false;
+        }
+
+        lastSolvedFingerprint = '';
+        nuggetContext = '';
+        sameQuestionAttempts = 0;
+        questionStartTime = Date.now();
+        lastActivityTime = Date.now();
+        await centuryPage.waitForTimeout(Math.floor(1500 * await getTurboMultiplier()));
+        return true;
     };
 
     // Robust Score Extraction
@@ -749,7 +770,32 @@ const Brain = require('./brain');
             let optionElements = [];
             let imageBase64 = null;
 
-            // 1. Initial Checks — rely on Playwright actionability; no manual spinner poll needed
+            // --- REDUNDANCY: Feature 3 — Stale Page Watchdog ---
+            // If no meaningful progress in 2 minutes while solver is running, reload
+            if (isSolverRunning && (Date.now() - lastActivityTime) > 120000) {
+                console.warn('[Watchdog] No activity for 2 minutes. Reloading page...');
+                lastActivityTime = Date.now();
+                await centuryPage.reload({ waitUntil: 'load' }).catch(() => { });
+                await centuryPage.waitForTimeout(3000);
+                continue;
+            }
+
+            // --- REDUNDANCY: Feature 1 — Stuck Question Hard Timeout (90s) ---
+            const timeOnQuestion = Date.now() - questionStartTime;
+            if (isSolverRunning && lastSolvedFingerprint !== '' && timeOnQuestion > 90000) {
+                console.warn(`[Timeout] Stuck on question for ${Math.round(timeOnQuestion / 1000)}s. Pressing I Don't Know...`);
+                const idkBtn = await centuryPage.$('button:has-text("I don\'t know"), button:has-text("I Don\'t Know"), [data-testid="idk-button"]').catch(() => null);
+                if (idkBtn && await idkBtn.isVisible()) {
+                    await safeClick(idkBtn);
+                    await centuryPage.waitForTimeout(1500);
+                }
+                lastSolvedFingerprint = '';
+                sameQuestionAttempts = 0;
+                questionStartTime = Date.now();
+                lastActivityTime = Date.now();
+                hasAttemptedSolve = false;
+                continue;
+            }
 
             // 2. Context Detection
             try {
@@ -804,11 +850,11 @@ const Brain = require('./brain');
             // --- PRIORITY 1: Immediate Question/Nugget Navigation ---
             // If a "Next Question" or "Next Nugget" button is visible, we click it immediately.
             const urgentNextBtn = await currentFrame.$([
+                'button[data-testid="button-next-question"]',
                 'button:has-text("Next Question")',
                 'button:has-text("NEXT QUESTION")',
                 'button:has-text("Next Nugget")',
                 'button:has-text("NEXT NUGGET")',
-                '[data-testid="button-next-question"]',
                 '.rc-results [class*="button"]',
                 ':has-text("Next Nugget")'
             ].join(', '));
@@ -829,9 +875,13 @@ const Brain = require('./brain');
                     }
                 }
 
+                // Brute force click via JS evaluation for maximum reliability
+                await urgentNextBtn.evaluate(el => el.click()).catch(() => { });
                 await safeClick(urgentNextBtn);
+
                 lastSolvedFingerprint = '';
                 sameQuestionAttempts = 0;
+                await centuryPage.waitForTimeout(500); // Settle
                 continue;
             }
 
@@ -946,7 +996,7 @@ const Brain = require('./brain');
                         const labelBoard = await currentFrame.$('[data-testid="labelling-question-board"], .rc-label-pair-list');
                         const container = labelBoard || await currentFrame.$('.rc-learning-nugget__question-container, .multi-question__question') || currentFrame.locator('body');
 
-                        const buffer = await container.screenshot({ scale: 'css' });
+                        const buffer = await centuryPage.screenshot({ scale: 'css' });
                         imageBase64 = buffer.toString('base64');
                         await updateGuiStatus('ANALYZING IMAGE...');
                     } catch (e) { console.log('[Vision] Failed'); }
@@ -1058,6 +1108,7 @@ const Brain = require('./brain');
                 } else {
                     sameQuestionAttempts = 0; // New question, reset counter
                     questionStartTime = Date.now();
+                    lastActivityTime = Date.now(); // Reset stale watchdog
                     hasAttemptedSolve = false;
                     isMatchingQuestion = false; // Reset matching flag
                 }
@@ -1124,12 +1175,14 @@ const Brain = require('./brain');
                             });
                         }
 
-                        // Fallback: Broader source selectors
+                        // Fallback: Broader source selectors for any draggable content
                         if (sourceTexts.length === 0) {
                             sourceTexts = await currentFrame.evaluate(() => {
                                 const seen = new Set();
-                                return [...document.querySelectorAll('[draggable="true"], .draggable-label-item, .matching-additional-list__item, div[class*="draggable"], .co-drag-drop-source')].map(el => {
-                                    const txt = el.innerText || '';
+                                const draggables = document.querySelectorAll('[draggable="true"], .draggable-label-item, .matching-additional-list__item, [class*="draggable"], .co-drag-drop-source, .rc-label-pair-base__field');
+                                return [...draggables].map(el => {
+                                    // Get text from el or any child span/div
+                                    const txt = (el.innerText || el.textContent || '').trim();
                                     if (txt && !seen.has(txt)) { seen.add(txt); return txt; }
                                     return '';
                                 }).filter(Boolean);
@@ -1137,10 +1190,10 @@ const Brain = require('./brain');
                             sourceTexts = sourceTexts.map(cleanText);
                         }
 
-                        // Robust Skip Detection for Image-only Matching
+                        // Optimized Skip Detection: Only skip if we have absolutely no clues
                         const draggablesCount = await currentFrame.locator('[draggable="true"]').count().catch(() => 0);
-                        if (isMatching && draggablesCount > 0 && sourceTexts.length === 0) {
-                            console.log(`[Matching] Image-only layout detected (${draggablesCount} draggables found with no text labels). Skipping...`);
+                        if (isMatching && draggablesCount === 0 && sourceTexts.length === 0) {
+                            console.log(`[Matching] No draggables found. Skipping...`);
                             const idkBtn = await currentFrame.$('button:has-text("I don\'t know"), [data-testid="button-skip"], button:has-text("skip"), button:has-text("Skip")');
                             if (idkBtn) {
                                 await safeClick(idkBtn, 'I Don\'t Know');
@@ -1148,8 +1201,6 @@ const Brain = require('./brain');
                                 lastSolvedFingerprint = currentFingerprint;
                                 sameQuestionAttempts = 0;
                                 continue;
-                            } else {
-                                console.log('[Matching] Skip requested but "I don\'t know" button not found.');
                             }
                         }
 
@@ -1179,7 +1230,7 @@ const Brain = require('./brain');
                                 // Determine expected target count from the UI
                                 const expectedTargetCount = await currentFrame.evaluate(() => {
                                     const layoutA = document.querySelectorAll('.rc-label-pair-list__item').length;
-                                    const layoutB = document.querySelectorAll('.prompt-answer-list__item').length;
+                                    const layoutB = document.querySelectorAll('.prompt-answer-list__item, .rc-prompt-answer-pair').length;
                                     return Math.max(layoutA, layoutB, 0);
                                 });
 

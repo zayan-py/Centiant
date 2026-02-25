@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Century Solver Pro - Dashboard</title>
+    <title>Centiant</title>
     <link rel="stylesheet" href="index.css">
 </head>
 
@@ -13,7 +13,7 @@
         <header>
             <div class="logo">
                 <span class="gear">⚙️</span>
-                <h1>CENTURY SOLVER <span>PRO</span></h1>
+                <h1>Centiant <span>PRO</span></h1>
             </div>
             <div class="status-indicator">
                 <button id="force-refresh" class="refresh-btn" title="Force Refresh">↻</button>
@@ -25,7 +25,7 @@
         <!-- Connectivity Guard -->
         <div id="offline-overlay" class="offline-warning">
             <div class="warning-card">
-                <h2>🚫 PRO BACKEND NOT DETECTED</h2>
+                <h2>🚫 BACKEND NOT DETECTED</h2>
                 <p>This Dashboard is a remote control. It ONLY works if the solver script is running.</p>
                 <p><strong>To fix:</strong> Close this tab and double-click <code>run.bat</code> in your folder.</p>
             </div>
@@ -76,16 +76,14 @@
                         </label>
                     </div>
 
-                    <div class="setting"
-                        style="display: flex; flex-direction: column; gap: 10px; align-items: stretch;">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="color: #bc8cff; font-weight: bold;">Turbo Power ⚡</span>
-                            <span id="turbo-level-display"
-                                style="color: var(--accent-secondary); font-weight: bold; font-family: monospace; background: rgba(188, 140, 255, 0.1); padding: 2px 8px; border-radius: 4px;">1x</span>
-                        </div>
-                        <input type="range" id="turbo-slider" min="1" max="20" value="1" class="modern-slider">
-                        <p class="hint" id="turbo-hint">Standard speed. Reliable and human-like.</p>
+                    <div class="setting">
+                        <span style="color: #bc8cff; font-weight: bold;">Turbo Mode ⚡</span>
+                        <label class="switch">
+                            <input type="checkbox" id="turbo-toggle">
+                            <span class="slider round"></span>
+                        </label>
                     </div>
+                    <p class="hint" id="turbo-hint">Standard speed. Reliable and human-like.</p>
                 </div>
 
                 <div class="card glass small">

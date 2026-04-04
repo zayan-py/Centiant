@@ -1,37 +1,14 @@
-const { chromium } = require('playwright');
-require('dotenv').config();
+const { launchBrowser, login } = require('./common');
 
 async function scrape(username, password, mode, targetUrl = null) {
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
+    const { browser, context } = await launchBrowser();
     const page = await context.newPage();
 
     try {
-        await page.goto('https://app.century.tech/login/', { waitUntil: 'networkidle' });
-        await page.fill('input[name="username"]', username);
-        await page.fill('input[name="password"]', password);
-        await page.click('button[type="submit"]');
-
-        // Wait for navigation or error
-        try {
-            await Promise.race([
-                page.waitForURL('**/learn/**', { timeout: 15000 }),
-                page.waitForSelector('[data-testid="login-form-error"]', { timeout: 15000 })
-            ]);
-
-            if (!page.url().includes('/learn/')) {
-                const errorMsg = await page.evaluate(() => {
-                    return document.querySelector('[data-testid="login-form-error"]')?.innerText.trim() || "Login failed";
-                });
-                console.log(JSON.stringify({ success: false, error: errorMsg }));
-                return;
-            }
-        } catch (e) {
-            console.log(JSON.stringify({ success: false, error: "Authentication timed out" }));
-            return;
-        }
+        if (!await login(page, username, password)) return;
 
         if (mode === 'assignments') {
+            console.log("STATUS:Scanning for due assignments...");
             await page.goto('https://app.century.tech/learn/assignments/due', { waitUntil: 'networkidle' });
             const assignments = await page.evaluate(() => {
                 const items = Array.from(document.querySelectorAll('.due-assignments-list__body a'));
@@ -46,24 +23,40 @@ async function scrape(username, password, mode, targetUrl = null) {
             });
             console.log(JSON.stringify({ success: true, assignments }));
         } else if (mode === 'nuggets' && targetUrl) {
-            await page.goto(targetUrl, { waitUntil: 'networkidle' });
+            console.log("STATUS:Navigating to assignment nuggets...");
+            const fullUrl = targetUrl.startsWith('http') ? targetUrl : `https://app.century.tech${targetUrl.startsWith('/') ? '' : '/'}${targetUrl}`;
+            await page.goto(fullUrl, { waitUntil: 'networkidle' });
 
             // Wait for nugget list to load
+            console.log("STATUS:Waiting for content to load...");
             await page.waitForSelector('.rc-nugget-list__item', { timeout: 10000 }).catch(() => { });
+
+            console.log("STATUS:Scraping nuggets...");
 
             const nuggets = await page.evaluate(() => {
                 const items = Array.from(document.querySelectorAll('.rc-nugget-list__item'));
-                return items.map(item => {
+                const queue = [];
+                items.forEach(item => {
                     const link = item.querySelector('a[data-testid="nugget-link"], a[data-testid="smart-nugget-link"]');
                     const titleEl = item.querySelector('[data-testid="nugget-title"]');
+                    const scoreRing = item.querySelector('.rc-percentage-ring--score');
+                    const completionRing = item.querySelector('.rc-percentage-ring--completion');
+
                     if (link && titleEl) {
-                        return {
-                            title: titleEl.innerText.trim(),
-                            url: link.href
-                        };
+                        let completionScore = 0;
+                        if (completionRing) completionScore = parseInt(completionRing.getAttribute('data-score') || '0');
+                        else if (scoreRing) completionScore = parseInt(scoreRing.getAttribute('data-score') || '0');
+
+                        if (completionScore < 80) {
+                            queue.push({
+                                title: titleEl.innerText.trim(),
+                                url: link.href,
+                                completion: completionScore
+                            });
+                        }
                     }
-                    return null;
-                }).filter(n => n !== null);
+                });
+                return queue;
             });
             console.log(JSON.stringify({ success: true, nuggets }));
         }

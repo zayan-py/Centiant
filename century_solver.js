@@ -1,5 +1,4 @@
-require('dotenv').config();
-const { chromium } = require('playwright');
+const { launchBrowser, login } = require('./common');
 const fs = require('fs');
 const path = require('path');
 const Brain = require('./brain');
@@ -18,13 +17,60 @@ const Brain = require('./brain');
         console.log('[Config] WARNING: No OpenAI API Key found in .env!');
     }
 
-    // 2. Launch Browser (Headless for Bot execution)
+    // 2. Launch Browser
+    const { browser, context } = await launchBrowser();
     const isHeadless = process.env.HEADLESS !== 'false';
-    const browser = await chromium.launch({
-        headless: isHeadless,
-        args: isHeadless ? [] : ['--start-maximized']
+
+    // --- STEALTH: TIME WARP OVERCLOCKER ---
+    // This script hijacks the browser's internal clock and timers to fool Century's servers.
+    // 1. Speeds up Date.now() and performance.now() by 10x.
+    // 2. Intercepts setInterval and setTimeout to speed up the heartbeat frequency.
+    // 3. Ensures 'msSinceLastPing' is calculated correctly based on the warped time.
+    await context.addInitScript(() => {
+        const SPEED_X = 10; // 10x Speed: 1 minute real = 10 minutes Century
+        const startTime = Date.now();
+        const startPerf = performance.now();
+
+        // 1. Warp Date and Performance
+        const origDateNow = Date.now;
+        Date.now = function () {
+            return startTime + (origDateNow.call(Date) - startTime) * SPEED_X;
+        };
+        const origPerfNow = performance.now;
+        performance.now = function () {
+            return startPerf + (origPerfNow.call(performance) - startPerf) * SPEED_X;
+        };
+
+        // 2. Warp Timers (Forces more frequent Heartbeats)
+        const origSetTimeout = window.setTimeout;
+        window.setTimeout = function (fn, delay, ...args) {
+            return origSetTimeout.call(window, fn, delay / SPEED_X, ...args);
+        };
+        const origSetInterval = window.setInterval;
+        window.setInterval = function (fn, delay, ...args) {
+            return origSetInterval.call(window, fn, delay / SPEED_X, ...args);
+        };
+
+        // 3. Intercept Fetch to maintain consistency
+        const originalFetch = window.fetch;
+        window.fetch = function (...args) {
+            const url = args[0];
+            if (typeof url === 'string' && (url.includes('pings/focus') || url.includes('pings'))) {
+                try {
+                    const options = args[1];
+                    if (options && options.body) {
+                        const body = JSON.parse(options.body);
+                        if (body.msSinceLastPing) {
+                            // The server might cap msSinceLastPing, but since we've speed up the 
+                            // frequency of pings, we'll send many more of them.
+                        }
+                    }
+                } catch (e) { }
+            }
+            return originalFetch.apply(this, args);
+        };
+        console.log(`[TimeWarp] Active: 1s real = ${SPEED_X}s spoofed.`);
     });
-    const context = await browser.newContext({ viewport: isHeadless ? { width: 1280, height: 720 } : null });
 
     // TAB 1: Dashboard GUI
     const guiPage = await context.newPage();
@@ -35,10 +81,8 @@ const Brain = require('./brain');
 
     // TAB 2: Century Tech (Initially Login)
     const centuryPage = await context.newPage();
-    await centuryPage.goto('https://app.century.tech/login/');
 
-    // 3. Setup Communication Functions
-    // This allows the Dashboard JS to talk to this Node script
+    // Communication & State
     let resolveUrl = null;
     let resolveAnswer = null;
     let lastSolvedFingerprint = '';
@@ -49,10 +93,87 @@ const Brain = require('./brain');
     let lastLoggedNugget = '';
     let nuggetContext = ''
     let nuggetQueue = [];
+    let totalNuggetsInQueue = 0;
+    let completedNuggets = 0;
     let allScores = [];
     let isSolverRunning = false;
     let lastActivityTime = Date.now();   // Stale page watchdog
     let sessionStartTime = Date.now();   // For session report
+
+    // Support Bot input: If a nugget URL is passed via process.argv[2]
+    const initialNugget = process.argv[2];
+    if (initialNugget) {
+        console.log(`[Bot] Targets received. Populating queue...`);
+        const targets = initialNugget.split(',');
+        for (const t of targets) {
+            const trimmedT = t.trim();
+            if (!trimmedT) continue;
+            const fullUrl = trimmedT.startsWith('http') ? trimmedT : `https://app.century.tech${trimmedT.startsWith('/') ? '' : '/'}${trimmedT}`;
+            nuggetQueue.push(fullUrl);
+        }
+        totalNuggetsInQueue = nuggetQueue.length;
+        completedNuggets = 0;
+        isSolverRunning = true;
+    }
+
+    console.log("STATUS:Connecting to Century website...");
+    let isTerminating = false;
+
+    // --- INTERACTIVE COMMANDS ---
+    process.stdin.on('data', async (data) => {
+        const cmd = data.toString().trim().toUpperCase();
+        if (cmd === 'SKIP') {
+            console.log('[Remote] Received SKIP command');
+            const idkBtn = await centuryPage.$('button:has-text("I don\'t know"), button:has-text("I Don\'t Know"), [data-testid="idk-button"], button:has-text("skip")');
+            if (idkBtn) await safeClick(idkBtn);
+        } else if (cmd === 'TERMINATE') {
+            console.log('[Remote] Received TERMINATE command. Shutting down...');
+            isTerminating = true;
+            await browser.close().catch(() => { });
+            process.exit(0);
+        }
+    });
+
+    // --- HEARTBEAT & TIME STATS ---
+    setInterval(() => {
+        if (!isSolverRunning || isTerminating) return;
+        const totalElapsed = Math.round((Date.now() - sessionStartTime) / 1000);
+        const questionElapsed = Math.round((Date.now() - questionStartTime) / 1000);
+        const spoofedTotal = totalElapsed * 10; // Match the SPEED_X in addInitScript
+        console.log(`STATUS: TIME|total=${totalElapsed}|spoofed=${spoofedTotal}|q=${questionElapsed}`);
+    }, 10000);
+    // Bot auto-login
+    if (config.username && config.password) {
+        await login(centuryPage, config.username, config.password);
+    }
+
+    // If we have an initial nugget, jump to it immediately after login
+    if (nuggetQueue.length > 0) {
+        console.log("STATUS:Jumping to requested nugget...");
+        const nextTarget = nuggetQueue[0];
+        nuggetQueue.shift(); // Remove from queue
+        await centuryPage.goto(nextTarget, { waitUntil: 'load' }).catch(() => { });
+        console.log("STATUS:Arrived at nugget page. Scanning...");
+    } else {
+        // GUI MODE STARTUP: Landing flow
+        console.log('Logging in to Century...');
+        await updateGuiStatus('LOGGING IN...');
+
+        // Only attempt navigation to due page if not already there (auto-login might have put us in /learn/)
+        const currentUrl = centuryPage.url();
+        if (!currentUrl.includes('/learn/assignments/due')) {
+            await updateGuiStatus('AUTO-SCRAPING ASSIGNMENTS...');
+            await centuryPage.goto('https://app.century.tech/learn/assignments/due').catch(() => { });
+        }
+
+        await updateGuiStatus('READY - Auto-fetching tasks...');
+        // Automatically trigger the fetch button in the GUI
+        await guiPage.evaluate(() => {
+            const btn = document.getElementById('fetch-btn');
+            if (btn) btn.click();
+        });
+        await updateGuiStatus('READY - Check Assignments Panel');
+    }
 
     // 1b. Load Persistent Scores
     const scoresPath = path.join(__dirname, 'scores.csv');
@@ -70,22 +191,68 @@ const Brain = require('./brain');
     }
 
 
-    // --- AUTOMATION HELPERS ---
-    // Helper: High-speed direct click bypassing human-like scrolling
+    // Helper: Hybrid Click — handles React synthetic events + raw browser events
     const safeClick = async (locator) => {
         if (!locator) return;
         try {
-            // JS injection click is often more reliable in high-speed automation
-            await locator.evaluate(el => el.click()).catch(() => locator.click({ force: true, timeout: 1000 }));
-        } catch (e) { }
+            // 1. Try React-friendly synthetic click first
+            const clicked = await locator.evaluate(el => {
+                if (el) { el.click(); return true; }
+                return false;
+            });
+            if (!clicked) return;
+
+            // 2. Dispatch native mouse event as fallback for non-React listeners
+            await locator.evaluate(el => {
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            });
+        } catch (e) {
+            // 3. Final Playwright force-click fallback
+            await locator.click({ force: true, timeout: 2000 }).catch(() => { });
+        }
+    };
+
+    // Helper: Global Forceful Slide-Skip (Recursive Shadow DOM search)
+    const forceNextSlide = async (page) => {
+        const allFrames = [page, ...page.frames()];
+        const results = await Promise.all(allFrames.map(frame =>
+            frame.evaluate(() => {
+                const findElementAnywhere = (root, selector) => {
+                    const el = root.querySelector(selector);
+                    if (el) return el;
+                    const hosts = root.querySelectorAll('*');
+                    for (const host of hosts) {
+                        if (host.shadowRoot) {
+                            const found = findElementAnywhere(host.shadowRoot, selector);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                };
+
+                const btn = findElementAnywhere(document, '[data-testid="button-next-slide"]') ||
+                    findElementAnywhere(document, '[data-testid="button-next-question"]') ||
+                    findElementAnywhere(document, '.btn-icon--nextIcon') ||
+                    findElementAnywhere(document, 'button[aria-label="Next slide"]') ||
+                    findElementAnywhere(document, 'button[aria-label="Next"]');
+
+                if (btn) {
+                    console.log("[JS-Context] Found slide button, executing click.");
+                    btn.click();
+                    return true;
+                }
+                return false;
+            }).catch(() => false)
+        ));
+        return results.some(r => r === true);
     };
 
     // Helper: Deduplicated score logger
-    const logScore = async (acc) => {
+    const logScore = async (acc, timeStr = null) => {
         if (acc !== null && !isNaN(acc) && lastLoggedNugget !== nuggetContext) {
-            console.log(`[Stats] Accuracy Recorded: ${acc}%`);
+            console.log(`[Stats] Accuracy Recorded: ${acc}%${timeStr ? ` | Time Recorded: ${timeStr}` : ''}`);
             // BOT SYNC: Output special progress token
-            console.log(`PROGRESS: SCORE:${acc}`);
+            console.log(`PROGRESS: SCORE:${acc}${timeStr ? `|TIME:${timeStr}` : ''}`);
             allScores.push(acc);
             fs.appendFileSync(scoresPath, `${acc}\n`);
             lastLoggedNugget = nuggetContext;
@@ -96,6 +263,9 @@ const Brain = require('./brain');
 
     // Helper: Deep text normalization (collapses whitespace/newlines)
     const cleanText = (str) => (str || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+    // Helper: Alphanumeric-only version for aggressive fuzzy matching (strips Unicode/formulas)
+    const alphaNum = (str) => cleanText(str).replace(/[^\x20-\x7E]/g, '').replace(/[^a-z0-9]/g, '');
 
     const executeSequentialDrag = async (frame, pairings) => {
         // Guard: already submitted? 
@@ -152,7 +322,9 @@ const Brain = require('./brain');
                     for (const d of dockDraggables) {
                         const txt = cleanText(await d.innerText().catch(() => ''));
                         if (availableSources.includes(txt)) continue; // Already used
-                        if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
+                        const matches = txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)
+                            || (alphaNum(txt) && alphaNum(txt) === alphaNum(expectedSource)); // Unicode fallback
+                        if (matches) {
                             const isVis = await d.isVisible().catch(() => false);
                             if (isVis) { sourceEl = d; break; }
                         }
@@ -166,16 +338,16 @@ const Brain = require('./brain');
                             if (availableSources.includes(txt)) continue; // Already used
                             const isPlaced = await d.evaluate(el => !!el.closest('.rc-label-pair-list__item')).catch(() => false);
                             if (isPlaced) continue;
-                            if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
-                                sourceEl = d; break;
-                            }
+                            const matches = txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)
+                                || (alphaNum(txt) && alphaNum(txt) === alphaNum(expectedSource)); // Unicode fallback
+                            if (matches) { sourceEl = d; break; }
                         }
                     }
 
                     if (sourceEl) {
                         console.log(`[SeqDrag] Card ${i + 1}: Dragging "${expectedSource}"`);
                         await dropZone.scrollIntoViewIfNeeded().catch(() => { });
-                        await sourceEl.dragTo(dropZone, { force: true, noWaitAfter: true });
+                        await sourceEl.dragTo(dropZone, { force: true, noWaitAfter: true, timeout: 1500 });
                         await frame.waitForTimeout(150); // Minimal settle time for DOM update
                         availableSources.push(expectedSource); // Mark as used
                         successCount++;
@@ -245,7 +417,9 @@ const Brain = require('./brain');
                     for (const src of dockDraggables) {
                         const txt = cleanText(await src.innerText().catch(() => ''));
                         if (availableSources.includes(txt)) continue; // Already used
-                        if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
+                        const matches = txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)
+                            || (alphaNum(txt) && alphaNum(txt) === alphaNum(expectedSource)); // Unicode fallback
+                        if (matches) {
                             const isVis = await src.isVisible().catch(() => false);
                             if (isVis) { sourceEl = src; break; }
                         }
@@ -257,19 +431,16 @@ const Brain = require('./brain');
                         for (const src of allSources) {
                             const txt = cleanText(await src.innerText().catch(() => ''));
                             if (availableSources.includes(txt)) continue; // Already used
-                            // Only "placed" if it's in the second field (answer slot) of a row
                             const isPlaced = await src.evaluate(el => {
                                 const field = el.closest('.rc-prompt-answer-pair__field');
                                 if (!field) return false;
                                 const fields = [...field.parentElement.querySelectorAll('.rc-prompt-answer-pair__field')];
                                 return fields.indexOf(field) === 1;
                             }).catch(() => false);
-
                             if (isPlaced) continue;
-
-                            if (txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)) {
-                                sourceEl = src; break;
-                            }
+                            const matches = txt === expectedSource || txt.includes(expectedSource) || expectedSource.includes(txt)
+                                || (alphaNum(txt) && alphaNum(txt) === alphaNum(expectedSource)); // Unicode fallback
+                            if (matches) { sourceEl = src; break; }
                         }
                     }
 
@@ -277,7 +448,7 @@ const Brain = require('./brain');
                         console.log(`[SeqDrag] Row ${i}: Dragging "${expectedSource}" to "${labelText}"`);
                         // Scroll to target first to ensure it's in the interactive area
                         await answerSlot.scrollIntoViewIfNeeded().catch(() => { });
-                        await sourceEl.dragTo(answerSlot, { force: true, noWaitAfter: true });
+                        await sourceEl.dragTo(answerSlot, { force: true, noWaitAfter: true, timeout: 1500 });
                         await frame.waitForTimeout(150); // Minimal settle time for DOM update
                         availableSources.push(expectedSource); // Mark as used
                     } else {
@@ -450,6 +621,8 @@ const Brain = require('./brain');
             }
 
             nuggetQueue = nuggets.map(n => n.url);
+            totalNuggetsInQueue = nuggetQueue.length;
+            completedNuggets = 0;
             isSolverRunning = true;
 
             // Send queue details to GUI (titles)
@@ -498,29 +671,7 @@ const Brain = require('./brain');
         }, { q: questionText, opts: options });
     };
 
-    // 5. Execution Flow
-    console.log('Logging in to Century...');
-    await updateGuiStatus('LOGGING IN...');
-    await centuryPage.fill('input[name="username"]', config.username || 'Zayan123');
-    await centuryPage.fill('input[name="password"]', config.password || 'Zayan123');
-    const loginBtn = await centuryPage.$('button[type="submit"]');
-    await safeClick(loginBtn, 'Login Button');
-
-    try {
-        await centuryPage.waitForURL('**/learn/**', { timeout: 30000 });
-        console.log('Logged in successfully.');
-        await updateGuiStatus('AUTO-SCRAPING ASSIGNMENTS...');
-        await centuryPage.goto('https://app.century.tech/learn/assignments/due');
-        await updateGuiStatus('READY - Auto-fetching tasks...');
-        // Automatically trigger the fetch button in the GUI
-        await guiPage.evaluate(() => {
-            const btn = document.getElementById('fetch-btn');
-            if (btn) btn.click();
-        });
-        await updateGuiStatus('READY - Check Assignments Panel');
-    } catch (e) {
-        await updateGuiStatus('LOGIN ERROR - Check config.json');
-    }
+    // 5. Execution Flow handled in startup block above
 
     // Wait for Dashboard URL Submission
     // Dashboard Interface Handling
@@ -594,6 +745,12 @@ const Brain = require('./brain');
         const hint = document.getElementById('turbo-hint');
 
         if (turboToggle && hint) {
+            // Initialize display state for Turbo Mode (since we set 'checked' in HTML)
+            if (turboToggle.checked) {
+                hint.innerText = "MAX TURBO. Absolute maximum software speed.";
+                hint.style.color = "#ff4d4d";
+            }
+
             turboToggle.onchange = () => {
                 const isMax = turboToggle.checked;
                 hint.innerText = isMax
@@ -605,7 +762,9 @@ const Brain = require('./brain');
     });
 
     // No longer waiting for a single URL to start - the loop handles queue transitions.
-    isSolverRunning = false; // Becomes true when an assignment or nugget is started
+    if (!initialNugget) {
+        isSolverRunning = false; // Becomes true when an assignment or nugget is started
+    }
 
 
 
@@ -629,21 +788,19 @@ const Brain = require('./brain');
         }
     });
 
-    const getDelay = async (type) => {
-        const isTurbo = await guiPage.evaluate(() => document.getElementById('turbo-toggle')?.checked || false);
-        const multiplier = isTurbo ? 0.01 : 1.0;
-
-        switch (type) {
-            case 'thinking': return Math.max(1, Math.floor(1500 * multiplier));
-            case 'feedback': return Math.max(1, Math.floor(3000 * multiplier));
-            case 'nav': return Math.max(1, Math.floor(1000 * multiplier));
-            default: return Math.max(1, Math.floor(1000 * multiplier));
-        }
-    };
-
     const getTurboMultiplier = async () => {
         const isTurbo = await guiPage.evaluate(() => document.getElementById('turbo-toggle')?.checked || false);
         return isTurbo ? 0.01 : 1.0;
+    };
+
+    const getDelay = async (type) => {
+        const multiplier = await getTurboMultiplier();
+        switch (type) {
+            case 'thinking': return Math.max(1, Math.floor(200 * multiplier));
+            case 'feedback': return Math.max(1, Math.floor(500 * multiplier));
+            case 'nav': return Math.max(1, Math.floor(300 * multiplier));
+            default: return Math.max(1, Math.floor(300 * multiplier));
+        }
     };
 
     // Session Summary & Auto-Terminate
@@ -678,12 +835,19 @@ const Brain = require('./brain');
             return false;
         }
 
+        completedNuggets++;
         const nextUrl = nuggetQueue.shift();
-        console.log(`[Queue] Moving to next nugget. ${nuggetQueue.length} remaining.`);
+        console.log(`[Queue] Moving to next nugget (${completedNuggets}/${totalNuggetsInQueue}). ${nuggetQueue.length} remaining.`);
         // BOT SYNC: Output special progress token
-        console.log(`PROGRESS: NEXT_NUGGET:${nuggetQueue.length}`);
+        console.log(`PROGRESS: NEXT_NUGGET:${completedNuggets}/${totalNuggetsInQueue}`);
         await updateGuiStats();
-        await updateGuiStatus('LOADING NEXT NUGGET...');
+        await updateGuiStatus(`LOADING NUGGET ${completedNuggets}/${totalNuggetsInQueue}...`);
+
+        // Reset state for the new nugget
+        lastSolvedFingerprint = '';
+        questionStartTime = Date.now();
+        hasAttemptedSolve = false;
+        sameQuestionAttempts = 0;
 
         // Feature 6: Auto-retry navigation up to 3 times
         let navSuccess = false;
@@ -759,21 +923,117 @@ const Brain = require('./brain');
         return null;
     };
 
+    // Robust Time/Duration Extraction
+    const getNuggetDuration = async (frame) => {
+        try {
+            // Century usually has stats like "Time taken: 05:22" or "Time taken: 2m 15s"
+            const potentialTimeEls = await frame.$$('.cds-stat-value__value, [data-testid*="time"], .rc-results__stat-value, .rc-results__score-value');
+            for (const el of potentialTimeEls) {
+                const text = (await el.innerText()).trim();
+                // Look for patterns: 05:22 or 2m 15s or 1 minute
+                if (text.match(/^\d+:\d+$/) || text.match(/\d+m\s*\d+s/) || text.match(/\d+\s*min/)) {
+                    const contextText = await frame.evaluate(e => {
+                        let p = e.parentElement;
+                        let combined = (p ? (p.innerText || '') : '').toLowerCase();
+                        if (p && p.parentElement) combined += ' ' + (p.parentElement.innerText || '').toLowerCase();
+                        return combined;
+                    }, el);
+
+                    if (contextText.includes('time') || contextText.includes('took') || contextText.includes('duration')) {
+                        return text;
+                    }
+                }
+            }
+        } catch (e) { }
+        return null;
+    };
+
+    let firstLoop = true;
     while (true) {
         if (!isSolverRunning && nuggetQueue.length === 0) {
-            // If not solving, just scan for assignments or wait
-            if (centuryPage.url().includes('/assignments/due')) {
-                // Scan for tasks maybe? For now just wait for input
-            }
-            await centuryPage.waitForTimeout(500);
+            await centuryPage.waitForTimeout(1000);
             continue;
         }
 
+        if (firstLoop) {
+            if (isTerminating) break;
+            console.log("STATUS:Engine active. Detecting question...");
+            firstLoop = false;
+        }
+
+        let currentFrame = centuryPage;
+        let found = false;
         try {
-            let currentFrame = centuryPage;
             let options = [];
             let optionElements = [];
             let imageBase64 = null;
+
+            // 3. Scan for active question
+            const scan = async (frame) => {
+                const candidates = await frame.$$('.rc-multiple-choice-question, .rc-learning-nugget__question-container, .multi-question__question, .rc-learning-question');
+                for (const c of candidates) {
+                    if (await c.isVisible()) {
+                        const isActive = await frame.evaluate(el => {
+                            const rect = el.getBoundingClientRect();
+                            const vh = window.innerHeight;
+                            const vw = window.innerWidth;
+                            return Math.abs((rect.left + rect.width / 2) - vw / 2) < vw * 0.4 &&
+                                Math.abs((rect.top + rect.height / 2) - vh / 2) < vh * 0.5 &&
+                                rect.height > 20;
+                        }, c);
+                        if (isActive) {
+                            const header = await c.$('.rc-multiple-choice-question__question, .rc-learning-nugget__question-container, h2, h3, .question-text');
+                            const t = header ? (await header.innerText()).trim() : (await c.innerText()).trim();
+                            const full = (await c.innerText()).trim();
+                            if (t.length > 3) return { el: c, text: t, fullText: full };
+                        }
+                    }
+                }
+                return null;
+            };
+
+            found = await scan(centuryPage);
+            if (!found) {
+                for (const f of centuryPage.frames()) {
+                    const fFound = await scan(f);
+                    if (fFound) { found = fFound; currentFrame = f; break; }
+                }
+            }
+
+            if (!found) {
+                // If no question found, check for blue "Next" arrows (Slideshows) or results screens
+                console.log("STATUS:Engine active. No question visible, checking for navigation...");
+
+                // === PRIMARY SKIP: Results/End Screens (Forceful Dispatch) ===
+                // Includes "Next Question", "Next Nugget", and Slideshow arrows
+                if (await forceNextSlide(centuryPage)) {
+                    console.log("[Flow] Force-Skip: Navigation triggered via Global Dispatcher.");
+
+                    // Termination watchdog: if this skip leads to lesson end and queue is empty
+                    if (nuggetQueue.length === 0) {
+                        const isEnd = await centuryPage.evaluate(() => {
+                            const txt = (document.body.innerText || '').toLowerCase();
+                            return txt.includes('thank you') || txt.includes('completion');
+                        });
+                        if (isEnd) {
+                            console.log('[Complete] Force-Skip reached lesson end. Terminating queue.');
+                            await terminateSession();
+                            break;
+                        }
+                    }
+                    await centuryPage.waitForTimeout(500);
+                    continue;
+                }
+
+                // Final wait before retry if absolutely nothing found
+                await centuryPage.waitForTimeout(1000);
+                continue;
+            }
+
+            // If we found something, update activity
+            lastActivityTime = Date.now();
+            // We only reset questionStartTime in the fingerprint check below if it's new
+            console.log(`STATUS:Question identified. Thinking...`);
 
             // --- REDUNDANCY: Feature 3 — Stale Page Watchdog ---
             // If no meaningful progress in 2 minutes while solver is running, reload
@@ -785,14 +1045,19 @@ const Brain = require('./brain');
                 continue;
             }
 
-            // --- REDUNDANCY: Feature 1 — Stuck Question Hard Timeout (90s) ---
+            // --- REDUNDANCY: Feature 1 — Stuck Question Hard Timeout (1.5m / 90s) ---
             const timeOnQuestion = Date.now() - questionStartTime;
-            if (isSolverRunning && lastSolvedFingerprint !== '' && timeOnQuestion > 90000) {
+            if (isSolverRunning && timeOnQuestion > 90000) {
                 console.warn(`[Timeout] Stuck on question for ${Math.round(timeOnQuestion / 1000)}s. Pressing I Don't Know...`);
-                const idkBtn = await centuryPage.$('button:has-text("I don\'t know"), button:has-text("I Don\'t Know"), [data-testid="idk-button"]').catch(() => null);
+                // Use broad IDK selector
+                const idkBtn = await currentFrame.$('button:has-text("I don\'t know"), button:has-text("I Don\'t Know"), [data-testid="idk-button"], button:has-text("skip")').catch(() => null);
                 if (idkBtn && await idkBtn.isVisible()) {
                     await safeClick(idkBtn);
                     await centuryPage.waitForTimeout(1500);
+                } else {
+                    // If no IDK button, try to force a reload as a last resort
+                    console.warn('[Timeout] No IDK button found. Reloading...');
+                    await centuryPage.reload().catch(() => { });
                 }
                 lastSolvedFingerprint = '';
                 sameQuestionAttempts = 0;
@@ -820,37 +1085,6 @@ const Brain = require('./brain');
                 }
             } catch (ignore) { }
 
-            // 3. Scan for active question
-            const scan = async (frame) => {
-                const candidates = await frame.$$('.rc-multiple-choice-question, .rc-learning-nugget__question-container, .multi-question__question, .rc-learning-question');
-                for (const c of candidates) {
-                    if (await c.isVisible()) {
-                        const isActive = await frame.evaluate(el => {
-                            const rect = el.getBoundingClientRect();
-                            const vh = window.innerHeight;
-                            const vw = window.innerWidth;
-                            return Math.abs((rect.left + rect.width / 2) - vw / 2) < vw * 0.4 &&
-                                Math.abs((rect.top + rect.height / 2) - vh / 2) < vh * 0.5 &&
-                                rect.height > 20;
-                        }, c);
-                        if (isActive) {
-                            const header = await c.$('.rc-multiple-choice-question__question, .rc-learning-nugget__question-container, h2, h3, .question-text');
-                            const t = header ? (await header.innerText()).trim() : (await c.innerText()).trim();
-                            const full = (await c.innerText()).trim();
-                            if (t.length > 3) return { el: c, text: t, fullText: full };
-                        }
-                    }
-                }
-                return null;
-            };
-
-            let found = await scan(centuryPage);
-            if (!found) {
-                for (const f of centuryPage.frames()) {
-                    found = await scan(f);
-                    if (found) { currentFrame = f; break; }
-                }
-            }
 
             // --- PRIORITY 1: Immediate Question/Nugget Navigation ---
             // If a "Next Question" or "Next Nugget" button is visible, we click it immediately.
@@ -860,34 +1094,46 @@ const Brain = require('./brain');
                 'button:has-text("NEXT QUESTION")',
                 'button:has-text("Next Nugget")',
                 'button:has-text("NEXT NUGGET")',
-                '.rc-results [class*="button"]',
-                ':has-text("Next Nugget")'
+                '.rc-results button.btn--primary',
+                '.rc-results button.btn--secondary',
+                'button:has-text("Continue")'
             ].join(', '));
 
             if (urgentNextBtn && await urgentNextBtn.isVisible()) {
                 const btnText = (await urgentNextBtn.innerText().catch(() => '')).toLowerCase();
-                console.log(`[Flow] Urgent Navigation detected ("${btnText.split('\n')[0]}") - clicking...`);
 
-                if (btnText.includes('next nugget')) {
-                    // Try to log score before jumping
-                    let acc = await getNuggetScore(currentFrame);
-                    if (!acc) acc = await getNuggetScore(centuryPage);
-                    await logScore(acc);
+                // IGNORE dashboard/sidebar links like "My Path"
+                const cleanBtnText = cleanText(btnText);
+                if (cleanBtnText.includes('my path') || cleanBtnText.includes('dashboard') || cleanBtnText.includes('back to') || cleanBtnText === 'path') {
+                    // Do nothing, proceed to standard scan
+                } else {
+                    console.log(`[Flow] Urgent Navigation detected ("${btnText.split('\n')[0]}") - clicking...`);
 
-                    if (nuggetQueue.length > 0) {
-                        console.log('[Flow] Next Nugget button detected. Jumping queue...');
-                        if (await navigateToNextNugget()) continue;
+                    if (btnText.includes('next nugget')) {
+                        // Try to log score before jumping
+                        let acc = await getNuggetScore(currentFrame);
+                        if (!acc) acc = await getNuggetScore(centuryPage);
+                        await logScore(acc);
+
+                        if (nuggetQueue.length > 0) {
+                            console.log('[Flow] Next Nugget button detected. Jumping queue...');
+                            if (await navigateToNextNugget()) continue;
+                        } else {
+                            // IF QUEUE IS EMPTY: Stop here and let the results detection handle termination
+                            console.log('[Flow] Next Nugget detected but queue is empty. Stopping navigation.');
+                            continue;
+                        }
                     }
+
+                    // Brute force click via JS evaluation for maximum reliability
+                    await urgentNextBtn.evaluate(el => el.click()).catch(() => { });
+                    await safeClick(urgentNextBtn);
+
+                    lastSolvedFingerprint = '';
+                    sameQuestionAttempts = 0;
+                    await centuryPage.waitForTimeout(100); // Minimal settle
+                    continue;
                 }
-
-                // Brute force click via JS evaluation for maximum reliability
-                await urgentNextBtn.evaluate(el => el.click()).catch(() => { });
-                await safeClick(urgentNextBtn);
-
-                lastSolvedFingerprint = '';
-                sameQuestionAttempts = 0;
-                await centuryPage.waitForTimeout(500); // Settle
-                continue;
             }
 
             // Scraper Logic: Passive background scraping when on assignment lists
@@ -936,6 +1182,7 @@ const Brain = require('./brain');
                     found.fullText.includes('Feedback') ||
                     found.fullText.toLowerCase().includes('thank you') ||
                     found.fullText.toLowerCase().includes('completing') ||
+                    found.fullText.toLowerCase().includes('diagnostic') ||
                     !!hasFeedbackRef;
 
                 if (isFeedback) {
@@ -976,12 +1223,9 @@ const Brain = require('./brain');
                                 if (await navigateToNextNugget()) continue;
                             } else {
                                 // FINAL FEEDBACK SCREEN - All nuggets done
-                                console.log('[Complete] All nuggets finished. Stopping solver.');
-                                await updateGuiStatus('🎉 ASSIGNMENT COMPLETE! All nuggets finished.');
-                                isSolverRunning = false;
-                                await centuryPage.waitForTimeout(2000);
-                                await centuryPage.goto('https://app.century.tech/learn/assignments/due').catch(() => { });
-                                continue; // Return to top of loop to wait in idle state
+                                console.log('[Complete] All nuggets finished. Triggering session report.');
+                                await terminateSession();
+                                break;
                             }
                         }
 
@@ -1112,7 +1356,7 @@ const Brain = require('./brain');
                     continue;
                 } else {
                     sameQuestionAttempts = 0; // New question, reset counter
-                    questionStartTime = Date.now();
+                    questionStartTime = Date.now(); // START TIMER for new question
                     lastActivityTime = Date.now(); // Reset stale watchdog
                     hasAttemptedSolve = false;
                     isMatchingQuestion = false; // Reset matching flag
@@ -1140,6 +1384,7 @@ const Brain = require('./brain');
                         continue;
                     }
 
+                    console.log(`STATUS:Solving ${isMatching ? 'Matching' : 'MCQ'}...`);
                     await updateGuiStatus('AI THINKING...');
                     await centuryPage.waitForTimeout(await getDelay('thinking'));
 
@@ -1147,18 +1392,30 @@ const Brain = require('./brain');
                         // 1. Fast DOM scrape: extract all target labels and source texts
                         // Use textContent (not innerText) to match what the RegExp locator sees
                         let targetTexts = await currentFrame.evaluate(() => {
-                            return [...document.querySelectorAll('.rc-prompt-answer-pair')].map(row => {
-                                const fields = row.querySelectorAll('.rc-prompt-answer-pair__field');
-                                return fields[0]?.textContent || '';
+                            return [...document.querySelectorAll('.rc-prompt-answer-pair, .rc-label-pair-list__item')].map(row => {
+                                const field = row.querySelector('.rc-prompt-answer-pair__field, .rc-label-pair-list__item-label');
+                                return field ? (field.innerText || '').trim() : '';
                             }).filter(Boolean);
                         });
                         targetTexts = targetTexts.map(cleanText);
 
                         let sourceTexts = await currentFrame.evaluate(() => {
+                            // Find the "Additional Answers" dock — try all known class names
+                            const dock = document.querySelector(
+                                '.rc-matching-additional-list, .rc-additional-answers, .draggable-label-container, .rc-learning-nugget__additional-answers'
+                            );
+                            const scope = dock || document;
                             const blacklist = ['additional answers', 'drag and drop', 'prompt', 'answer', 'target'];
-                            return [...document.querySelectorAll('.draggable-label-item[draggable="true"]')].map(el => {
+
+                            return [...scope.querySelectorAll('[draggable="true"], .draggable-label-item, .rc-matching-answer-draggable')].map(el => {
+                                // Skip items that are visibility:hidden (already placed in a target slot)
+                                const wrapper = el.closest('[style*="visibility"]') || el;
+                                const vis = window.getComputedStyle(wrapper).visibility;
+                                if (vis === 'hidden') return '';
+
                                 const txt = (el.innerText || '').trim();
-                                return (!blacklist.includes(txt.toLowerCase())) ? txt : '';
+                                if (!txt || blacklist.includes(txt.toLowerCase())) return '';
+                                return txt;
                             }).filter(Boolean);
                         });
                         sourceTexts = sourceTexts.map(cleanText);
@@ -1237,6 +1494,27 @@ const Brain = require('./brain');
                                 }
                                 pairs = cleanPairs;
 
+                                // DEDUP: If the AI assigned the same source to multiple targets,
+                                // reassign duplicates to any unused sources from the dock
+                                const usedSources = new Set();
+                                const duplicateTargets = [];
+                                for (const [target, source] of Object.entries(pairs)) {
+                                    if (usedSources.has(source)) {
+                                        duplicateTargets.push(target);
+                                    } else {
+                                        usedSources.add(source);
+                                    }
+                                }
+                                if (duplicateTargets.length > 0) {
+                                    // Find unused sources from the scraped source list
+                                    const unusedSources = sourceTexts.filter(s => !usedSources.has(s));
+                                    console.log(`[Matching] AI returned ${duplicateTargets.length} duplicate source(s). Rebalancing with unused: [${unusedSources.join(', ')}]`);
+                                    for (let di = 0; di < duplicateTargets.length && di < unusedSources.length; di++) {
+                                        console.log(`[Matching] Reassigning "${duplicateTargets[di]}" → "${unusedSources[di]}" (was duplicate)`);
+                                        pairs[duplicateTargets[di]] = unusedSources[di];
+                                    }
+                                }
+
                                 const totalPairs = Object.keys(pairs).length;
                                 // Determine expected target count from the UI
                                 const expectedTargetCount = await currentFrame.evaluate(() => {
@@ -1269,8 +1547,8 @@ const Brain = require('./brain');
                                         lastSolvedFingerprint = '';
                                         sameQuestionAttempts = 0;
                                         await centuryPage.waitForTimeout(5000);
-                                        continue;
                                     }
+                                    continue; // RETRY! Don't drop through to slide-skipping
                                 }
                             }
                         }
@@ -1281,6 +1559,7 @@ const Brain = require('./brain');
 
                         response = await Brain.solve(found.text, options, config.openai_api_key, nuggetContext, imageBase64, hasGuppy, brainModel);
                         if (response) {
+                            console.log("STATUS:Answering question...");
                             await updateGuiStatus('AI SOLVED');
                             lastSolvedFingerprint = currentFingerprint;
                             hasAttemptedSolve = true;
@@ -1374,8 +1653,8 @@ const Brain = require('./brain');
                         else {
                             console.log('[Fallback] No inputs found. Attempting to click element by text...');
                             try {
-                                // Scoped search inside question container is more reliable
-                                const textElement = questionContainer.getByText(response.value, { exact: false }).first();
+                                // Scoped search inside question container using frame locator
+                                const textElement = currentFrame.getByText(response.value, { exact: false }).first();
                                 if (await textElement.isVisible()) {
                                     await safeClick(textElement);
                                     await centuryPage.waitForTimeout(500);
@@ -1401,23 +1680,35 @@ const Brain = require('./brain');
                 }
 
                 const cont = await currentFrame.$('button.btn--secondary:has-text("NEXT QUESTION"), button.btn--secondary:has-text("Next Question"), button.btn--secondary:has-text("CONTINUE"), [data-testid="button-next-question"]');
-                if (cont) await safeClick(cont);
+                if (cont) {
+                    console.log("STATUS:Moving to next question...");
+                    await cont.evaluate(el => el.click()).catch(() => { });
+                }
             } else {
                 // NOT FOUND: Skips & Results
-                const skip = await guiPage.evaluate(() => document.getElementById('skip-lessons')?.checked || false);
-                const btn = await centuryPage.$('button.btn--primary:has-text("START"), button.btn--primary:has-text("CONTINUE"), button.btn--secondary:has-text("NEXT"), button.btn--primary:has-text("DONE")');
+                const skip = true; // High-speed default for bot
+                const btn = await centuryPage.$('button.btn--primary:has-text("START"), button.btn--primary:has-text("CONTINUE"), button.btn--secondary:has-text("NEXT"), button.btn--primary:has-text("DONE"), button:has-text("Continue")');
 
                 if (skip && btn && await btn.isVisible()) {
-                    const q = await centuryPage.$('.rc-learning-question, .multi-question__question');
+                    const q = await centuryPage.$('.rc-learning-question, .multi-question__question, .rc-multiple-choice-question');
                     if (!q || !(await q.isVisible())) {
+                        console.log("STATUS:Skipping educational lesson...");
                         await updateGuiStatus('SKIPPING LESSON...');
-                        await safeClick(btn); lastSolvedFingerprint = '';
+                        // Direct JS Injection Click
+                        await btn.evaluate(el => el.click()).catch(() => { });
+                        lastSolvedFingerprint = '';
+                        await centuryPage.waitForTimeout(100);
+                        await centuryPage.waitForTimeout(50); // Minimized from 100
+                        continue;
                     }
-                } else {
+                }
+                else {
                     // Check for Results/Next Nugget
                     const resSelector = [
                         'h2:has-text("Results")',
                         '.rc-results__score',
+                        '.rc-results__header',
+                        '.rc-results__title',
                         '[class*="results"]',
                         'button:has-text("Next Nugget")',
                         'button:has-text("View results")',
@@ -1425,17 +1716,36 @@ const Brain = require('./brain');
                         ':has-text("completing the diagnostic")'
                     ].join(', ');
 
-                    const res = await centuryPage.$(resSelector);
+                    let res = await centuryPage.$(resSelector);
+                    let resFrame = centuryPage;
+
+                    // Results might be in an iframe
+                    if (!res) {
+                        for (const f of centuryPage.frames()) {
+                            const fRes = await f.$(resSelector).catch(() => null);
+                            if (fRes && await fRes.isVisible()) {
+                                res = fRes;
+                                resFrame = f;
+                                break;
+                            }
+                        }
+                    }
+
                     if (res && await res.isVisible()) {
                         const resText = (await res.innerText().catch(() => '')).toLowerCase();
                         if (resText.includes('view results')) {
-                            await safeClick(res, 'View Results');
+                            await safeClick(res);
                             await centuryPage.waitForTimeout(Math.floor(2000 * await getTurboMultiplier()));
                         }
 
-                        // Log accuracy
-                        const scoreVal = await getNuggetScore(centuryPage);
-                        await logScore(scoreVal);
+                        // Log accuracy and duration
+                        let scoreVal = await getNuggetScore(resFrame);
+                        if (scoreVal === null) scoreVal = await getNuggetScore(centuryPage);
+
+                        let timeVal = await getNuggetDuration(resFrame);
+                        if (timeVal === null) timeVal = await getNuggetDuration(centuryPage);
+
+                        await logScore(scoreVal, timeVal);
 
                         // JUMP ON SCORE OR THANK YOU SCREEN
                         const isThankYou = resText.includes('thank you') || resText.includes('completing');
@@ -1445,26 +1755,23 @@ const Brain = require('./brain');
                                 console.log('[Flow] Results screen detected. Jumping to next nugget...');
                                 if (await navigateToNextNugget()) continue;
                             } else {
-                                console.log('[Complete] Assignment finished.');
+                                console.log('[Complete] All nuggets in queue finished. Triggering session report and termination.');
                                 await updateGuiStatus('🎉 ASSIGNMENT COMPLETE!');
                                 isSolverRunning = false;
                                 await centuryPage.waitForTimeout(Math.floor(3000 * await getTurboMultiplier()));
-                                await centuryPage.goto('https://app.century.tech/learn/assignments/due').catch(() => { });
+                                await terminateSession();
+                                break;
                             }
                         }
                     }
                 }
 
-                // FINAL FALLBACK: Start the queue only if we are strictly on the assignment page
-                const url = centuryPage.url();
-                if (!found && nuggetQueue.length > 0 && url.includes('/assignments/due')) {
-                    console.log('[Flow] On assignment page with pending queue. Starting first nugget...');
-                    await navigateToNextNugget();
-                }
             }
         } catch (e) {
             console.log('Loop Error:', e.message);
         }
-        await centuryPage.waitForTimeout(100);
+
+
+        await centuryPage.waitForTimeout(10);
     }
 })();

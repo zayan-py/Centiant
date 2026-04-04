@@ -1,45 +1,34 @@
-const { chromium } = require('playwright');
-require('dotenv').config();
+const { launchBrowser, login } = require('./common');
 
 async function validate(username, password) {
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
+    const { browser, context } = await launchBrowser();
     const page = await context.newPage();
 
     try {
-        await page.goto('https://app.century.tech/login/', { waitUntil: 'networkidle' });
-        await page.fill('input[name="username"]', username);
-        await page.fill('input[name="password"]', password);
-        await page.click('button[type="submit"]');
+        if (!await login(page, username, password)) return;
 
-        // Wait for navigation or error
-        try {
-            await Promise.race([
-                page.waitForURL('**/learn/**', { timeout: 15000 }),
-                page.waitForSelector('[data-testid="login-form-error"]', { timeout: 15000 })
-            ]);
-
-            if (page.url().includes('/learn/')) {
-                // If login successful, scrape names of due assignments as a bonus
-                await page.goto('https://app.century.tech/learn/assignments/due', { waitUntil: 'networkidle' });
-                const assignments = await page.evaluate(() => {
-                    const items = Array.from(document.querySelectorAll('.due-assignments-list__body a'));
-                    return items.map(a => {
-                        const title = a.querySelector('.due-assignments-item__title')?.innerText || 'Untitled';
-                        return title;
-                    });
-                });
-
-                console.log(JSON.stringify({ success: true, assignments: assignments }));
-            } else {
-                const errorMsg = await page.evaluate(() => {
-                    return document.querySelector('[data-testid="login-form-error"]')?.innerText.trim() || "Invalid credentials";
-                });
-                console.log(JSON.stringify({ success: false, error: errorMsg }));
+        console.log("STATUS:Login success! Scraping profile name...");
+        // Scrape name from My Path
+        await page.goto('https://app.century.tech/learn/my-path', { waitUntil: 'networkidle' });
+        const name = await page.evaluate(() => {
+            const titleEl = document.querySelector('.cds-widget__title--centred');
+            if (titleEl) {
+                // Look only at the direct text node before the <div> or <button>
+                const text = titleEl.childNodes[0]?.textContent || "";
+                return text.replace("'s Recommended Path", "").trim();
             }
-        } catch (e) {
-            console.log(JSON.stringify({ success: false, error: "Authentication timed out or failed" }));
-        }
+            return "Student";
+        });
+
+        // Also scrape names of due assignments as a bonus
+        console.log("STATUS:Finalizing initialization...");
+        await page.goto('https://app.century.tech/learn/assignments/due', { waitUntil: 'networkidle' });
+        const assignments = await page.evaluate(() => {
+            const items = Array.from(document.querySelectorAll('.due-assignments-list__body a'));
+            return items.map(a => a.querySelector('.due-assignments-item__title')?.innerText || 'Untitled');
+        });
+
+        console.log(JSON.stringify({ success: true, name: name, assignments: assignments }));
     } catch (e) {
         console.log(JSON.stringify({ success: false, error: e.message }));
     } finally {

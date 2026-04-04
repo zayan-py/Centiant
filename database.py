@@ -11,7 +11,15 @@ def init_db():
                   century_user TEXT, 
                   century_pass TEXT, 
                   is_redeemed BOOLEAN DEFAULT 0, 
-                  is_locked BOOLEAN DEFAULT 0)''')
+                  is_locked BOOLEAN DEFAULT 0,
+                  century_name TEXT)''')
+    
+    # Migration: Add century_name if table exists but column doesn't
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN century_name TEXT")
+    except sqlite3.OperationalError:
+        pass # Column already exists
+    
     conn.commit()
     conn.close()
 
@@ -31,11 +39,11 @@ def redeem_user(discord_id):
     conn.commit()
     conn.close()
 
-def update_credentials(discord_id, username, password):
+def update_credentials(discord_id, username, password, name):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("UPDATE users SET century_user=?, century_pass=?, is_locked=1 WHERE discord_id=?", 
-              (username, password, str(discord_id)))
+    c.execute("UPDATE users SET century_user=?, century_pass=?, is_locked=1, century_name=? WHERE discord_id=?", 
+              (username, password, name, str(discord_id)))
     conn.commit()
     conn.close()
 
